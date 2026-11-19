@@ -149,6 +149,7 @@ class ModlistSync(mobase.IPlugin):
             game_nexus_name=game.gameNexusName(),
             mo2_version=str(o.appVersion().canonicalString()),
             include_downloads=bool(self._setting("sync_downloads_meta", True)),
+            user_rules=Path(o.basePath()) / "mo2linttricks-rules.json",
         )
 
     def client(self) -> GitHub | None:

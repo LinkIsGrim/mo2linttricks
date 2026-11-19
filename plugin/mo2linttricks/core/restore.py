@@ -24,14 +24,24 @@ class PlanRow:
     kind: str
     action: str
     info: dict = field(default_factory=dict)
-    archive: str = ""  # local archive path when known
+    archives: list[str] = field(default_factory=list)  # local archive paths, in install order
+    missing_files: list[int] = field(default_factory=list)  # Nexus file ids still to download
     status: str = ""  # UI status override
+
+    @property
+    def nexus_files(self) -> list[int]:
+        """All Nexus file ids that make up this mod, in install order (merged mods have several)."""
+        files = self.info.get("files") or []
+        if files:
+            return [int(f["fileid"]) for f in files]
+        ids = self.info.get("fileids") or []
+        return [int(ids[-1])] if ids else []
 
     @property
     def nexus_ids(self) -> tuple[int, int] | None:
         modid = int(self.info.get("modid") or 0)
-        fileids = self.info.get("fileids") or []
-        return (modid, int(fileids[-1])) if modid and fileids else None
+        files = self.nexus_files
+        return (modid, files[-1]) if modid and files else None
 
     def nexus_page(self, game_nexus_name: str) -> str:
         modid = self.info.get("modid")
@@ -57,17 +67,25 @@ def plan(
         info = mods.get(name, {})
         row = PlanRow(name, int(e.get("priority", 0)), bool(e.get("enabled")), kind, MANUAL, info)
         inst_file = Path(str(info.get("installationFile", "")).replace("\\", "/")).name.lower()
+        files = info.get("files") or []
+        if files:
+            have = [archives.get(str(f.get("archive", "")).lower()) for f in files]
+            row.archives = [str(a) for a in have if a]
+            row.missing_files = [int(f["fileid"]) for f, a in zip(files, have) if not a]
+        elif inst_file and inst_file in archives:
+            row.archives = [str(archives[inst_file])]
         if kind == "foreign":
             row.action = GAME
         elif name in installed_mods:
             row.action = INSTALLED
         elif kind == "separator":
             row.action = CREATE_SEPARATOR
-        elif inst_file and inst_file in archives:
+        elif row.archives and not row.missing_files:
             row.action = INSTALL_ARCHIVE
-            row.archive = str(archives[inst_file])
         elif row.nexus_ids:
             row.action = DOWNLOAD_NEXUS
+            if not files:
+                row.missing_files = row.nexus_files
         elif info.get("downloadUrl") or info.get("url"):
             row.action = DOWNLOAD_URL
         rows.append(row)

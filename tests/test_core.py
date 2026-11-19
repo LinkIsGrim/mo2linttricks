@@ -195,6 +195,60 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot.build(self.info).files, snapshot.build(self.info).files)
 
 
+def dl_meta(modid, fileid, name, category=1, installed=True, mod_name="Big Mod"):
+    return (f"[General]\ngameName=cyberpunk2077\nmodID={modid}\nfileID={fileid}\nname={name}\n"
+            f"modName={mod_name}\nfileCategory={category}\ninstalled={'true' if installed else 'false'}\nuninstalled=false\n")
+
+
+class MergeTests(unittest.TestCase):
+    """Several Nexus files merged into one MO2 mod (MO2 keeps only the last in meta.ini)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        r = Path(self.tmp.name)
+        self.info = snapshot.InstanceInfo(r / "mods", r / "profiles", r / "downloads", "cyberpunk2077", "Cyberpunk 2077", "cyberpunk2077")
+        for d in (r / "mods/Big Mod", r / "mods/Big Mod - Compat", r / "profiles/Default", r / "downloads"):
+            d.mkdir(parents=True)
+        (r / "mods/Big Mod/meta.ini").write_text("[General]\nmodid=500\ninstallationFile=fix.7z\n[installedFiles]\n1\\modid=500\n1\\fileid=40\n")
+        (r / "mods/Big Mod - Compat/meta.ini").write_text("[General]\nmodid=500\n[installedFiles]\n1\\modid=500\n1\\fileid=30\n")
+        dl = r / "downloads"
+        (dl / "main.7z.meta").write_text(dl_meta(500, 10, "Main"))
+        (dl / "main-old.7z.meta").write_text(dl_meta(500, 5, "Main"))  # older upload of the same file
+        (dl / "timers.7z.meta").write_text(dl_meta(500, 20, "Timers"))
+        (dl / "timers-again.7z.meta").write_text(dl_meta(500, 20, "Timers"))  # duplicate download
+        (dl / "compat.zip.meta").write_text(dl_meta(500, 30, "Compat", category=3))
+        (dl / "fix.7z.meta").write_text(dl_meta(500, 40, "Fix", category=3))
+        (dl / "notinstalled.7z.meta").write_text(dl_meta(500, 50, "Other", installed=False))
+        for n in ("main.7z", "timers.7z", "compat.zip", "fix.7z"):
+            (dl / n).write_bytes(b"x")
+        (r / "profiles/Default/modlist.txt").write_text("+Big Mod - Compat\n+Big Mod\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_files_attributed(self):
+        mods = json.loads(snapshot.build(self.info).files["mods.json"])
+        self.assertEqual([f["fileid"] for f in mods["Big Mod"]["files"]], [10, 20, 40])  # main, merged, meta.ini file last
+        self.assertEqual([f["fileid"] for f in mods["Big Mod - Compat"]["files"]], [30])
+        self.assertEqual(mods["Big Mod"]["fileids"], [10, 20, 40])
+
+    def test_restore_plan_all_files(self):
+        snap = snapshot.build(self.info)
+        rows = {r.name: r for r in restore.plan(snap.files["profiles/Default/modlist.json"], snap.files["mods.json"], set(), self.info.downloads_dir)}
+        big = rows["Big Mod"]
+        self.assertEqual(big.action, restore.INSTALL_ARCHIVE)
+        self.assertEqual([Path(a).name for a in big.archives], ["main.7z", "timers.7z", "fix.7z"])
+        (self.info.downloads_dir / "timers.7z").unlink()
+        rows = {r.name: r for r in restore.plan(snap.files["profiles/Default/modlist.json"], snap.files["mods.json"], set(), self.info.downloads_dir)}
+        self.assertEqual(rows["Big Mod"].action, restore.DOWNLOAD_NEXUS)
+        self.assertEqual(rows["Big Mod"].missing_files, [20])
+
+    def test_readme_links_each_file(self):
+        readme = snapshot.build(self.info).files["README.md"].decode()
+        self.assertIn("mods/500?tab=files&file_id=20", readme)
+        self.assertIn("Big Mod / Timers", readme)
+
+
 class PushTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

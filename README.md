@@ -3,6 +3,7 @@
 Mod Organizer 2 plugins for Linux setups made with [MO2-LINT](https://github.com/furglitch/modorganizer2-linux-installer) (most of it works on any MO2 2.5 instance).
 
 - **Modlist Sync**: mirrors your modlist to a private GitHub repo, `mo2-mods-<game>`, automatically: load order, enabled state, and where every mod came from (Nexus mod and file IDs, URLs, archive names). MO2's own export drops the source; this keeps it.
+- **Load-order rules** (RimSort-style): community `load_after` / `load_before` / `load_bottom` / `incompatible_with` / `requires` rules, kept in this repo and downloaded on startup, plus your own rules synced with your modlist. They're checked against MO2's mod order, and **Sort** fixes the order with as few moves as possible.
 - **Restore**: rebuilds a synced profile in an instance: downloads missing mods, runs their installers, then applies the order and enabled state.
 - **GameMode**: puts the game, and only the game, into [Feral GameMode](https://github.com/FeralInteractive/gamemode) when MO2 launches it under Proton. It doesn't use `gamemoderun`, which breaks MO2.
 - **Conflict resolver** (Cyberpunk 2077): MO2 only sees conflicts between loose files. Cyberpunk mods mostly clash in three other places: `.archive` files replacing the same game resource, TweakXL files setting the same TweakDB value, and redscript mods replacing the same function. The resolver reports all three in MO2's problems indicator and under **Tools > mo2linttricks > Conflict resolver**. For TweakXL it writes an xEdit-style patch mod. For archives it can switch the Cyberpunk plugin to MO2's mod priority.
@@ -39,6 +40,14 @@ When it syncs:
 
 Each sync is one commit, made through GitHub's Git Data API, so no git is needed inside Wine. If nothing changed, no commit is made. Commit messages list what changed (installed, removed, updated, downloaded, toggled, reordered); the first sync of a session compares against what's on GitHub.
 
+**Merged mods.** When several Nexus files are merged into one MO2 mod (main file plus optional add-ons or patches), MO2's `meta.ini` keeps only the last one. Sync recovers the rest from `downloads/*.meta` (files marked installed):
+
+1. A file listed in a mod's `meta.ini` belongs to that mod.
+2. Otherwise it belongs to the only MO2 mod with that Nexus mod ID.
+3. Otherwise it goes to the mod named like the Nexus mod.
+
+Duplicate downloads collapse, and an older upload of the same named file is dropped. Restore downloads every part and installs them in order into the same mod; choose *Merge* when MO2 asks.
+
 Nexus's temporary, signed download links aren't stored, because they embed your Nexus user id and expire within a day. The mod and file IDs are kept instead.
 
 Repo layout. Only these paths are managed; anything else you add (such as a `NOTES.md`) is left alone.
@@ -47,10 +56,11 @@ Repo layout. Only these paths are managed; anything else you add (such as a `NOT
 |:--|:--|
 | `README.md` | generated: a table of every mod with version, its Nexus file link or source link, and the profiles it's enabled in, plus a list of all Nexus links |
 | `mo2linttricks.json` | game, MO2 version, profile names |
-| `mods.json` | per mod: `source` (`nexus` / `url` / `manual` / `separator`), version, Nexus `modid` + `fileids`, archive name, URLs |
+| `mods.json` | per mod: `source` (`nexus` / `url` / `manual` / `separator`), version, Nexus `modid` + `fileids`, archive name, URLs, and `files`: every Nexus file installed into the mod, including files merged into it |
 | `mods/<mod>/meta.ini` | MO2's metadata for the mod (minus the bulky `nexusDescription`) |
 | `downloads/<archive>.meta` | MO2's download metadata |
 | `profiles/<profile>/modlist.json` | load order, lowest priority first, with enabled state and kind |
+| `rules.json` | your own load-order rules (`mo2linttricks-rules.json` in the instance) |
 | `profiles/<profile>/*.txt, *.ini` | raw profile files (`modlist.txt`, `plugins.txt`, `loadorder.txt`, profile INIs) |
 
 Settings (under **mo2linttricks Modlist Sync**): `repo_name` (empty means `mo2-mods-<game>`), `debounce_seconds`, `sync_downloads_meta`.
@@ -110,6 +120,24 @@ YAML and `.tweak` files are both parsed. Package-relative names follow TweakXL's
 ### redscript
 
 The resolver reports functions that several mods replace with `@replaceMethod` or `@replaceGlobal`; only one replacement runs. Byte-identical replacements are marked harmless. `@wrapMethod` combines with other mods, so it isn't listed.
+
+## Load-order rules
+
+Community rules live in [`rules/cyberpunk2077.json`](rules/cyberpunk2077.json). The plugin fetches them on startup with a plain HTTPS GET from `raw.githubusercontent.com` (setting `rules_url`) and keeps a cached copy for offline use. Your own rules live in `<instance>/mo2linttricks-rules.json`, are synced as `rules.json`, and add to the community rules. Create them with **Add rule…**.
+
+```json
+"nexus:23219": {
+  "name": "LONGER LOCKDOWN - Act 1 Extended",
+  "load_after": ["nexus:13271", "nexus:23290"],
+  "note": "Author: ... (Give my mod priority.)",
+  "source": "https://www.nexusmods.com/cyberpunk2077/mods/23219"
+}
+```
+
+- **Identifying mods:** `nexus:<mod id>` matches any MO2 mod installed from that Nexus mod. `nexus:<mod id>:<file id>` matches the mod that installed that particular file, such as an optional compatibility add-on installed as its own MO2 mod. That mod is then excluded from the plain `nexus:<mod id>` key.
+- **Direction:** `load_after` means lower in MO2's list, which wins. That applies to loose files, to archives (with the Cyberpunk plugin's enforce and reverse settings) and to the TweakXL patch defaults.
+- **Sort** is a stable topological sort: mods without rules, and separators, keep their relative order. Contradictory rules are reported and skipped.
+- **Contributions:** every community rule must cite a source (the author's page, or "inferred from …"). Preferences belong in user rules.
 
 ## Development
 

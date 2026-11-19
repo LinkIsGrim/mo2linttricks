@@ -42,6 +42,7 @@ from PyQt6.QtWidgets import (
 
 from .core import archive_conflicts as ac
 from .core import redscript as rs
+from .core import rules as R
 from .core import tweaks as tw
 from .core.http import Transport
 from .sync_plugin import NAME as SYNC_NAME, VERSION
@@ -56,6 +57,16 @@ PROBLEM_ARCHIVE_CONFLICTS = 1
 PROBLEM_TWEAKS_UNRESOLVED = 2
 PROBLEM_PATCH_NOT_LAST = 3
 PROBLEM_SCRIPTS = 4
+PROBLEM_RULE_ORDER = 5
+PROBLEM_RULE_INCOMPATIBLE = 6
+PROBLEM_RULE_MISSING = 7
+
+RULES_URL = "https://raw.githubusercontent.com/LinkIsGrim/mo2linttricks/main/rules/cyberpunk2077.json"
+USER_RULES = "mo2linttricks-rules.json"
+
+
+class _Fetched(QObject):
+    done = pyqtSignal(str)
 
 
 class ConflictModel:
@@ -68,6 +79,12 @@ class ConflictModel:
         self.tweaks: tw.TweakScan = tw.TweakScan()
         self.scripts: list[rs.ScriptConflict] = []
         self.mods: list[tuple[str, Path]] = []
+        self.local: list[R.LocalMod] = []  # every MO2 mod, lowest priority first
+        self.rules: dict[str, R.ModRules] = {}
+        self.rules_report: R.Report = R.Report()
+        self.rules_status = "community rules not loaded yet"
+        self._fetched = _Fetched()
+        self._fetched.done.connect(self._rules_fetched)
         self.listeners: list = []
         self._timer = QTimer()
         self._timer.setSingleShot(True)
@@ -86,6 +103,7 @@ class ConflictModel:
         organizer.onFinishedRun(lambda _p, _c: self.invalidate())
         organizer.onUserInterfaceInitialized(lambda _w: self.invalidate())
         organizer.onPluginSettingChanged(self._setting_changed)
+        self.fetch_rules()
 
     def _setting_changed(self, plugin: str, _key: str, _old: object, _new: object) -> None:
         if plugin == CP_PLUGIN:
@@ -147,9 +165,66 @@ class ConflictModel:
         game = Path(o.managedGame().dataDirectory().absolutePath())
         return [("<game>", game)] + mods + [("<overwrite>", Path(o.overwritePath()))]
 
+    # --- load-order rules ----------------------------------------------------------------------
+
+    def community_rules_path(self) -> Path:
+        assert self.organizer
+        return _data_dir(self.organizer) / "rules-cyberpunk2077.json"
+
+    def user_rules_path(self) -> Path:
+        assert self.organizer
+        return Path(self.organizer.basePath()) / USER_RULES
+
+    def fetch_rules(self) -> None:
+        """Download the community rules (plain HTTPS GET), keep the cached copy on failure."""
+        if not self.organizer:
+            return
+        url = str(self.organizer.pluginSetting(DIAG_NAME, "rules_url") or RULES_URL)
+        dest = self.community_rules_path()
+
+        def run() -> None:
+            try:
+                r = Transport(timeout=20)("GET", url, {"Cache-Control": "no-cache"})
+                if r.status != 200:
+                    raise RuntimeError(f"HTTP {r.status}")
+                data = json.loads(r.body)
+                if not R.parse(data, "community"):
+                    raise RuntimeError("no usable rules in file")
+                dest.write_bytes(r.body)
+                self._fetched.done.emit(f"community rules updated ({len(data.get('mods', {}))} mods)")
+            except Exception as e:
+                self._fetched.done.emit(f"could not update community rules ({e}); using cached copy" if dest.exists() else f"could not download community rules ({e})")
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _rules_fetched(self, status: str) -> None:
+        self.rules_status = status
+        qInfo(f"mo2linttricks: {status}")
+        self.invalidate()
+
+    def _local_mods(self) -> list[R.LocalMod]:
+        o = self.organizer
+        assert o
+        ml = o.modList()
+        out = []
+        for name in ml.allModsByProfilePriority():
+            mod = ml.getMod(name)
+            enabled = bool(ml.state(name) & mobase.ModState.ACTIVE)
+            if mod is None or mod.isSeparator() or mod.isForeign():
+                out.append(R.LocalMod(name, 0, set(), enabled))
+            else:
+                out.append(R.read_local_mod(name, Path(mod.absolutePath()), enabled))
+        return out
+
     def rescan(self) -> None:
         if not self.applies():
             return
+        try:
+            self.local = self._local_mods()
+            self.rules = R.merge(R.load_file(self.community_rules_path(), "community"), R.load_file(self.user_rules_path(), "user"))
+            self.rules_report = R.check(self.local, self.rules)
+        except Exception as e:
+            qWarning(f"mo2linttricks rules: check failed: {e}")
         try:
             self.mods = self._active_mods()
             modlist, self.order_source = self._modlist(self.mods)
@@ -304,6 +379,7 @@ class ConflictsDiagnose(mobase.IPluginDiagnose):
     def settings(self) -> list[mobase.PluginSetting]:
         return [
             mobase.PluginSetting("notify_archive_conflicts", "Notify about any .archive conflicts, not only fully overridden archives", True),
+            mobase.PluginSetting("rules_url", "Community load-order rules (JSON, fetched on startup)", RULES_URL),
         ]
 
     def _enabled(self) -> bool:
@@ -325,6 +401,13 @@ class ConflictsDiagnose(mobase.IPluginDiagnose):
             problems.append(PROBLEM_PATCH_NOT_LAST)
         if any(not c.identical for c in MODEL.scripts):
             problems.append(PROBLEM_SCRIPTS)
+        rr = MODEL.rules_report
+        if rr.violations or rr.bottom_violations:
+            problems.append(PROBLEM_RULE_ORDER)
+        if rr.incompatible:
+            problems.append(PROBLEM_RULE_INCOMPATIBLE)
+        if rr.missing:
+            problems.append(PROBLEM_RULE_MISSING)
         return problems
 
     def shortDescription(self, key: int) -> str:
@@ -342,6 +425,13 @@ class ConflictsDiagnose(mobase.IPluginDiagnose):
             return "The mo2linttricks Patch is out of date"
         if key == PROBLEM_PATCH_NOT_LAST:
             return f"\"{PATCH_MOD}\" should be the last mod in the list"
+        rr = MODEL.rules_report
+        if key == PROBLEM_RULE_ORDER:
+            return f"{len(rr.violations) + len(rr.bottom_violations)} load-order rule(s) are broken by the current mod order"
+        if key == PROBLEM_RULE_INCOMPATIBLE:
+            return f"{len(rr.incompatible)} pair(s) of enabled mods are marked incompatible"
+        if key == PROBLEM_RULE_MISSING:
+            return f"{len(rr.missing)} mod requirement(s) are not installed or not enabled"
         n = sum(1 for c in MODEL.scripts if not c.identical)
         return f"{n} redscript function(s) are replaced by more than one mod"
 
@@ -380,6 +470,23 @@ class ConflictsDiagnose(mobase.IPluginDiagnose):
             )
         if key == PROBLEM_PATCH_NOT_LAST:
             return f"<p>Drag <b>{PATCH_MOD}</b> to the bottom of the mod list so nothing overrides it.</p>"
+        rr = MODEL.rules_report
+        if key == PROBLEM_RULE_ORDER:
+            items = "".join(
+                f"<li><b>{e.after}</b> should be below <b>{e.before}</b> ({e.rules.origin}: {e.rules.note or e.rule_key})</li>" for e in rr.violations
+            ) + "".join(f"<li><b>{b}</b> should be at the bottom</li>" for b in rr.bottom_violations)
+            return f"<p>Lower in MO2's list wins.</p><ul>{items}</ul><p>Fix: Conflict resolver &gt; Load order rules &gt; Sort.</p>"
+        if key == PROBLEM_RULE_INCOMPATIBLE:
+            items = "".join(f"<li><b>{a}</b> and <b>{b}</b>: {note}</li>" for a, b, note in rr.incompatible)
+            return f"<p>Disable one of each pair.</p><ul>{items}</ul>"
+        if key == PROBLEM_RULE_MISSING:
+            items = "".join(
+                f"<li><b>{m}</b> needs {req}"
+                + (f" (<a href='https://www.nexusmods.com/cyberpunk2077/mods/{req.split(':')[1]}'>Nexus</a>)" if req.startswith("nexus:") else "")
+                + "</li>"
+                for m, req in rr.missing
+            )
+            return f"<ul>{items}</ul>"
         items = "".join(
             f"<li><b>{c.target}</b>: " + ", ".join(sorted({r.mod for r in c.replacements})) + "</li>" for c in MODEL.scripts if not c.identical
         )
@@ -690,6 +797,141 @@ class ScriptTab(QWidget):
         lay.addWidget(tree, 1)
 
 
+class RulesTab(QWidget):
+    RELATIONS = [
+        ("must be below (load after, wins over)", "load_after"),
+        ("must be above (load before, loses to)", "load_before"),
+        ("is incompatible with", "incompatible_with"),
+        ("requires", "requires"),
+    ]
+
+    def __init__(self, organizer: mobase.IOrganizer, parent: QWidget):
+        super().__init__(parent)
+        self._o = organizer
+        lay = QVBoxLayout(self)
+        self._info = QLabel()
+        self._info.setWordWrap(True)
+        self._info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(self._info)
+        self._tree = QTreeWidget()
+        self._tree.setHeaderLabels(["Issue", "Rule", "Source"])
+        header = self._tree.header()
+        if header:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        lay.addWidget(self._tree, 1)
+        row = QHBoxLayout()
+        sort = QPushButton("Sort mod list...")
+        sort.clicked.connect(self._sort)
+        add = QPushButton("Add rule...")
+        add.clicked.connect(self._add_rule)
+        reload = QPushButton("Update community rules")
+        reload.clicked.connect(self._reload)
+        row.addWidget(sort)
+        row.addWidget(add)
+        row.addWidget(reload)
+        row.addStretch(1)
+        lay.addLayout(row)
+        MODEL.listeners.append(self.refresh_view)
+        self.destroyed.connect(self._detach)
+        self.refresh_view()
+
+    def _detach(self) -> None:
+        if self.refresh_view in MODEL.listeners:
+            MODEL.listeners.remove(self.refresh_view)
+
+    def refresh_view(self) -> None:
+        rr = MODEL.rules_report
+        applied = len({e.rule_key for e in rr.edges})
+        self._info.setText(
+            f"Rules: {MODEL.rules_status}. Your own rules: <code>{MODEL.user_rules_path()}</code> (synced to your modlist repo). "
+            f"{len(rr.edges)} ordering constraint(s) from {applied} rule(s) apply to your enabled mods. "
+            "Lower in MO2's list wins: loose files, archives (with the Cyberpunk plugin's MO2 order) and TweakXL patch defaults."
+        )
+        self._tree.clear()
+        red, ok = Qt.GlobalColor.red, Qt.GlobalColor.darkGreen
+        broken = {(e.before, e.after) for e in rr.violations}
+        groups = [
+            ("Order", [(f"{e.after} should be below {e.before}", e.rule_key, e.rules.source, (e.before, e.after) in broken) for e in rr.edges]
+             + [(f"{b} should be at the bottom", "load_bottom", "", b in rr.bottom_violations) for b in rr.bottom]),
+            ("Incompatible", [(f"{a} + {b}: {note}", "incompatible_with", "", True) for a, b, note in rr.incompatible]),
+            ("Missing requirements", [(f"{m} requires {req}", "requires", "", True) for m, req in rr.missing]),
+        ]
+        for title, items in groups:
+            top = QTreeWidgetItem([f"{title}: {sum(1 for i in items if i[3])} issue(s), {len(items)} rule(s)", "", ""])
+            for text, key, src, bad in sorted(items, key=lambda i: not i[3]):
+                child = QTreeWidgetItem([("BROKEN  " if bad else "ok  ") + text, key, src])
+                child.setForeground(0, red if bad else ok)
+                top.addChild(child)
+            self._tree.addTopLevelItem(top)
+            top.setExpanded(any(i[3] for i in items))
+
+    def _reload(self) -> None:
+        MODEL.rules_status = "updating community rules..."
+        self.refresh_view()
+        MODEL.fetch_rules()
+
+    def _sort(self) -> None:
+        rr = MODEL.rules_report
+        new, dropped = R.sort(MODEL.local, rr)
+        old = [m.name for m in MODEL.local]
+        moved = R.moves(old, new)
+        if not moved:
+            QMessageBox.information(self, "mo2linttricks", "The mod list already satisfies every rule.")
+            return
+        rows = "".join(f"<li>{n}: {old.index(n)} &rarr; {new.index(n)}</li>" for n in moved[:30])
+        more = f"<p>...and {len(moved) - 30} more.</p>" if len(moved) > 30 else ""
+        cyc = "<p>Rules that contradict each other were skipped:</p><ul>" + "".join(f"<li>{d}</li>" for d in dropped) + "</ul>" if dropped else ""
+        box = QMessageBox(
+            QMessageBox.Icon.Question, "Sort mod list?",
+            f"<p>{len(moved)} mod(s) move (position in MO2's list, 0 = top); everything else keeps its order:</p><ul>{rows}</ul>{more}{cyc}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self,
+        )
+        box.setTextFormat(Qt.TextFormat.RichText)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return
+        ml = self._o.modList()
+        for i, name in enumerate(new):
+            if name in moved:
+                ml.setPriority(name, i)
+        MODEL.rescan()
+        left = len(MODEL.rules_report.violations) + len(MODEL.rules_report.bottom_violations)
+        QMessageBox.information(self, "mo2linttricks", f"Moved {len(moved)} mod(s). Broken rules left: {left}.")
+
+    def _add_rule(self) -> None:
+        candidates = [m for m in MODEL.local if m.modid]
+        if len(candidates) < 2:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Add load-order rule")
+        lay = QVBoxLayout(dlg)
+        a, rel, b = QComboBox(), QComboBox(), QComboBox()
+        for m in candidates:
+            a.addItem(m.name, m)
+            b.addItem(m.name, m)
+        for text, key in self.RELATIONS:
+            rel.addItem(text, key)
+        for w in (a, rel, b):
+            lay.addWidget(w)
+        note = QLabel("Saved to your own rules (synced with your modlist repo). Share good ones by adding them to rules/cyberpunk2077.json in the mo2linttricks repo.")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        btns = QHBoxLayout()
+        okb, cancel = QPushButton("Add"), QPushButton("Cancel")
+        okb.clicked.connect(dlg.accept)
+        cancel.clicked.connect(dlg.reject)
+        btns.addStretch(1)
+        btns.addWidget(okb)
+        btns.addWidget(cancel)
+        lay.addLayout(btns)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        ma, mb = a.currentData(), b.currentData()
+        if ma.name == mb.name:
+            return
+        R.save_user_rule(MODEL.user_rules_path(), R.key_for(ma, MODEL.rules), rel.currentData(), R.key_for(mb, MODEL.rules), ma.name)
+        MODEL.rescan()
+
+
 class ResolverDialog(QDialog):
     def __init__(self, organizer: mobase.IOrganizer, parent: QWidget | None):
         super().__init__(parent)
@@ -703,6 +945,8 @@ class ResolverDialog(QDialog):
         tabs.addTab(TweakTab(organizer, self), f"TweakXL values ({len(MODEL.tweaks.real)})")
         tabs.addTab(ArchiveTab(organizer, self), f"Archives ({len(rep.real_conflicts) if rep else 0})")
         tabs.addTab(ScriptTab(self), f"redscript ({real_scripts})")
+        rr = MODEL.rules_report
+        tabs.addTab(RulesTab(organizer, self), f"Load order rules ({len(rr.violations) + len(rr.bottom_violations) + len(rr.incompatible) + len(rr.missing)})")
         lay.addWidget(tabs, 1)
         close = QPushButton("Close")
         close.clicked.connect(self.accept)

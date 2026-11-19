@@ -25,7 +25,7 @@ LAYOUT_VERSION = 1
 
 # Top-level paths this tool owns in the repo. Anything else (e.g. a README you
 # write yourself, CI files) is left alone by sync.
-MANAGED_PREFIXES = ("README.md", "mo2linttricks.json", "mods.json", "mods/", "downloads/", "profiles/")
+MANAGED_PREFIXES = ("README.md", "rules.json", "mo2linttricks.json", "mods.json", "mods/", "downloads/", "profiles/")
 
 PROFILE_FILE_SUFFIXES = (".txt", ".ini")
 PROFILE_SKIP = {"saves"}
@@ -42,6 +42,7 @@ class InstanceInfo:
     game_nexus_name: str = ""
     mo2_version: str = ""
     include_downloads: bool = True
+    user_rules: Path | None = None  # the instance's own load-order rules (mo2linttricks-rules.json)
 
 
 @dataclass
@@ -140,6 +141,73 @@ def describe_mod(name: str, meta: dict[str, dict[str, str]], download_meta: dict
     return {k: v for k, v in out.items() if v not in ("", [], 0) or k in ("source",)}
 
 
+def assign_merged_files(
+    mod_metas: dict[str, dict[str, dict[str, str]]],
+    downloads: dict[str, dict[str, dict[str, str]]],
+    game: str,
+) -> dict[str, list[dict]]:
+    """Every Nexus file installed into each mod, including files MERGED into an existing mod.
+
+    MO2 only keeps the last installed file in a mod's meta.ini, so merged parts (main file +
+    optional add-ons + patches) are recovered from downloads/*.meta (installed=true):
+      1. a file listed in a mod's meta.ini belongs to that mod;
+      2. otherwise to the only MO2 mod with that Nexus mod id;
+      3. otherwise to the mod named like the Nexus mod (modName), else the first such mod;
+    duplicates (same file id) collapse, and older versions of the same named file are dropped.
+    Order = install order guess: main files, then optional ones, the meta.ini file last.
+    """
+    by_modid: dict[int, list[str]] = {}
+    claimed: dict[int, str] = {}
+    last_file: dict[str, int] = {}
+    for name, meta in mod_metas.items():
+        g = meta.get("General", {})
+        mid = as_int(g.get("modid"))
+        if mid <= 0:
+            continue
+        by_modid.setdefault(mid, []).append(name)
+        for k, v in meta.get("installedFiles", {}).items():
+            if k.endswith("fileid") and as_int(v) > 0:
+                claimed[as_int(v)] = name
+                last_file[name] = as_int(v)
+
+    files: dict[str, dict[int, dict]] = {}
+    for archive, dl in downloads.items():
+        d = dl.get("General", {})
+        if not as_bool(d.get("installed")) or as_bool(d.get("uninstalled")):
+            continue
+        if game and d.get("gameName") and d.get("gameName", "").lower() != game.lower():
+            continue
+        mid, fid = as_int(d.get("modID")), as_int(d.get("fileID"))
+        if mid <= 0 or fid <= 0:
+            continue
+        owners = by_modid.get(mid, [])
+        if fid in claimed:
+            owner = claimed[fid]
+        elif len(owners) == 1:
+            owner = owners[0]
+        elif owners:
+            owner = next((o for o in owners if o == d.get("modName")), sorted(owners)[0])
+        else:
+            continue
+        files.setdefault(owner, {})[fid] = {
+            "fileid": fid,
+            "name": d.get("name", ""),
+            "version": d.get("version", ""),
+            "category": as_int(d.get("fileCategory")),
+            "archive": archive,
+        }
+
+    out: dict[str, list[dict]] = {}
+    for owner, by_fid in files.items():
+        newest: dict[str, dict] = {}
+        for f in sorted(by_fid.values(), key=lambda f: f["fileid"]):
+            newest[f["name"] or str(f["fileid"])] = f  # same file title: keep the newest upload
+        last = last_file.get(owner)
+        ordered = sorted(newest.values(), key=lambda f: (f["fileid"] == last, f["category"] != 1, f["fileid"]))
+        out[owner] = ordered
+    return out
+
+
 def build(info: InstanceInfo) -> Snapshot:
     snap = Snapshot()
 
@@ -150,22 +218,33 @@ def build(info: InstanceInfo) -> Snapshot:
             archive = meta_path.name[: -len(".meta")]
             # "removed" downloads are only hidden in MO2's list; keep them, they may be
             # the only record of a mod's Nexus ids.
-            downloads[archive.lower()] = read_ini(meta_path)
+            downloads[archive] = read_ini(meta_path)
             if info.include_downloads:
                 text = meta_path.read_text(encoding="utf-8", errors="replace")
                 snap.files[f"downloads/{meta_path.name}"] = _strip_download_meta(text).encode()
 
+    by_lower = {k.lower(): v for k, v in downloads.items()}
     mods: dict[str, dict] = {}
+    metas: dict[str, dict[str, dict[str, str]]] = {}
     if info.mods_dir.is_dir():
         for mod_dir in sorted(p for p in info.mods_dir.iterdir() if p.is_dir()):
             meta_path = mod_dir / "meta.ini"
             meta = read_ini(meta_path) if meta_path.is_file() else {}
+            metas[mod_dir.name] = meta
             inst = meta.get("General", {}).get("installationFile", "")
-            dl = downloads.get(Path(inst.replace("\\", "/")).name.lower()) if inst else None
+            dl = by_lower.get(Path(inst.replace("\\", "/")).name.lower()) if inst else None
             mods[mod_dir.name] = describe_mod(mod_dir.name, meta, dl)
             if meta_path.is_file():
                 text = meta_path.read_text(encoding="utf-8", errors="replace")
                 snap.files[f"mods/{mod_dir.name}/meta.ini"] = _strip_meta(text).encode()
+    for name, files in assign_merged_files(metas, downloads, info.game_short_name).items():
+        m = mods.get(name)
+        if m is None:
+            continue
+        m["files"] = files
+        m["fileids"] = sorted({*m.get("fileids", []), *(f["fileid"] for f in files)})
+        if m.get("source") in ("manual", "url") and m.get("modid"):
+            m["source"] = "nexus"
     snap.add_json("mods.json", mods)
 
     profiles = []
@@ -185,6 +264,8 @@ def build(info: InstanceInfo) -> Snapshot:
                         enabled_in.setdefault(e["name"], []).append(prof.name)
 
     snap.files["README.md"] = render_readme(info, mods, profiles, enabled_in).encode()
+    if info.user_rules and info.user_rules.is_file():
+        snap.files["rules.json"] = info.user_rules.read_bytes()
     snap.add_json(
         "mo2linttricks.json",
         {
@@ -225,18 +306,29 @@ def render_readme(info: InstanceInfo, mods: dict[str, dict], profiles: list[str]
         m = real[name]
         src = m.get("source")
         if src == "nexus" and info.game_nexus_name:
-            link = f"[Nexus {m['modid']}]({nexus_url(info.game_nexus_name, m['modid'], m.get('fileids'))})"
+            files = m.get("files") or []
+            if len(files) > 1:  # merged mod: one link per Nexus file
+                link = "<br>".join(
+                    f"[{_md(f.get('name') or f['fileid'])}]({nexus_url(info.game_nexus_name, m['modid'], [f['fileid']])})" for f in files
+                )
+            else:
+                link = f"[Nexus {m['modid']}]({nexus_url(info.game_nexus_name, m['modid'], m.get('fileids'))})"
         elif m.get("url") or m.get("downloadUrl"):
             u = m.get("url") or m.get("downloadUrl")
             link = f"[link]({u})"
         else:
             link = "manual"
         out.append(f"| {_md(name)} | {_md(m.get('version', ''))} | {link} | {_md(', '.join(enabled_in.get(name, [])))} |")
-    nexus = [
-        f"- {_md(n)}: {nexus_url(info.game_nexus_name, m['modid'], m.get('fileids'))}"
-        for n, m in sorted(real.items(), key=lambda kv: kv[0].lower())
-        if m.get("source") == "nexus" and info.game_nexus_name
-    ]
+    nexus = []
+    for n, m in sorted(real.items(), key=lambda kv: kv[0].lower()):
+        if m.get("source") != "nexus" or not info.game_nexus_name:
+            continue
+        files = m.get("files") or []
+        if len(files) > 1:
+            for f in files:
+                nexus.append(f"- {_md(n)} / {_md(f.get('name') or f['fileid'])}: {nexus_url(info.game_nexus_name, m['modid'], [f['fileid']])}")
+        else:
+            nexus.append(f"- {_md(n)}: {nexus_url(info.game_nexus_name, m['modid'], m.get('fileids'))}")
     if nexus:
         out += ["", "## Nexus links", "", *nexus]
     return "\n".join(out) + "\n"

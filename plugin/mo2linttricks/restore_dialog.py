@@ -208,12 +208,14 @@ class RestoreDialog(QDialog):
         nexus = self._o.managedGame().gameNexusName()
         for r in self._rows:
             if r.action == restore.DOWNLOAD_NEXUS and r.nexus_ids:
-                did = dm.startDownloadNexusFile(*r.nexus_ids)
-                if did >= 0:
-                    self._downloads[did] = r
-                    self._set(r, "downloading...")
-                else:
-                    self._open_page(r, nexus)
+                modid = r.nexus_ids[0]
+                for fid in list(r.missing_files):
+                    did = dm.startDownloadNexusFile(modid, fid)
+                    if did >= 0:
+                        self._downloads[did] = r
+                        self._set(r, f"downloading {len(r.missing_files)} file(s)...")
+                    else:
+                        self._open_page(r, nexus, fid)
             elif r.action == restore.DOWNLOAD_URL:
                 url = r.info.get("downloadUrl") or ""
                 if url:
@@ -224,27 +226,42 @@ class RestoreDialog(QDialog):
                     QDesktopServices.openUrl(QUrl(r.info["url"]))
                     self._set(r, "opened source page: download it into MO2's Downloads")
 
-    def _open_page(self, r: restore.PlanRow, nexus: str) -> None:
+    def _open_page(self, r: restore.PlanRow, nexus: str, fileid: int | None = None) -> None:
         page = r.nexus_page(nexus)
+        if fileid and r.nexus_ids:
+            page = f"https://www.nexusmods.com/{nexus}/mods/{r.nexus_ids[0]}?tab=files&file_id={fileid}"
         if page:
             QDesktopServices.openUrl(QUrl(page))
-            self._set(r, "opened Nexus page: click Mod Manager Download")
+            n = len(r.missing_files)
+            self._set(r, f"opened Nexus page: click Mod Manager Download ({n} file(s) needed)")
 
     def _row_for_download(self, did: int) -> restore.PlanRow | None:
         if did in self._downloads:
             return self._downloads.pop(did)
         # downloads started from the browser (nxm links) match by Nexus ids
         meta = read_ini(Path(self._o.downloadManager().downloadPath(did) + ".meta")).get("General", {})
-        ids = (as_int(meta.get("modID")), as_int(meta.get("fileID")))
+        modid, fileid = as_int(meta.get("modID")), as_int(meta.get("fileID"))
         for r in self._rows:
-            if r.action == restore.DOWNLOAD_NEXUS and r.nexus_ids == ids:
+            if r.action == restore.DOWNLOAD_NEXUS and r.nexus_ids and r.nexus_ids[0] == modid and fileid in r.missing_files:
                 return r
         return None
 
     def download_complete(self, did: int) -> None:
         r = self._row_for_download(did)
-        if r:
-            r.archive = self._o.downloadManager().downloadPath(did)
+        if not r:
+            return
+        path = self._o.downloadManager().downloadPath(did)
+        meta = read_ini(Path(path + ".meta")).get("General", {})
+        fid = as_int(meta.get("fileID"))
+        if fid in r.missing_files:
+            r.missing_files.remove(fid)
+        r.archives.append(path)
+        # keep the recorded install order (main files first, merged add-ons after)
+        order = {f: i for i, f in enumerate(r.nexus_files)}
+        r.archives.sort(key=lambda a: order.get(as_int(read_ini(Path(a + ".meta")).get("General", {}).get("fileID")), 999))
+        if r.missing_files:
+            self._set(r, f"downloaded {len(r.archives)}, {len(r.missing_files)} file(s) still needed")
+        else:
             self._set(r, "downloaded, ready to install", restore.INSTALL_ARCHIVE)
 
     def download_failed(self, did: int) -> None:
@@ -259,14 +276,18 @@ class RestoreDialog(QDialog):
 
     def _install_downloaded(self) -> None:
         for r in self._rows:
-            if r.action != restore.INSTALL_ARCHIVE or not r.archive:
+            if r.action != restore.INSTALL_ARCHIVE or not r.archives:
                 continue
-            self._set(r, "installing...")
-            mod = self._o.installMod(r.archive, r.name)
+            mod = None
+            for i, archive in enumerate(r.archives):
+                self._set(r, f"installing {i + 1}/{len(r.archives)}" + (" (choose Merge when asked)" if i else ""))
+                mod = self._o.installMod(archive, self._local_name.get(r.name, r.name))
+                if mod is None:
+                    break
+                self._local_name[r.name] = mod.name()
             if mod is None:
                 self._set(r, "install cancelled or failed")
                 continue
-            self._local_name[r.name] = mod.name()
             self._set(r, "installed" + (f" as {mod.name()}" if mod.name() != r.name else ""), restore.INSTALLED)
 
     # --- 3. apply -----------------------------------------------------------------------
