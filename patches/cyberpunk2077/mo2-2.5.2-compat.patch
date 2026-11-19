@@ -1,0 +1,11 @@
+--- a/games/game_cyberpunk2077.py (upstream fda5d6a, v3.0.1)
++++ b/games/game_cyberpunk2077.py
+@@ -233,7 +233,7 @@
+ 
+     def init(self, organizer: mobase.IOrganizer) -> bool:
+         super().init(organizer)
+-        self._register_feature(BasicLocalSavegames(self))
++        self._register_feature(BasicLocalSavegames(self.savesDirectory()))  # patched for MO2 2.5.2 basic_games bundle (pre-#208 API)
+         self._register_feature(
+             BasicGameSaveGameInfo(
+                 lambda p: Path(p or "", "screenshot.png"),

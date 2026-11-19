@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Steam launch-option wrapper: enable GameMode for Cyberpunk2077.exe only, not MO2.
+# gamemoderun's LD_PRELOAD breaks MO2 under mo2-lint, so instead we register the
+# game's PID with gamemoded once MO2 starts it. Usage in Steam launch options:
+#   ... /home/grim/.local/bin/cp2077-gamemode %command%
+#
+# The watcher must NOT wait on Steam's reaper: the reaper waits for all of its
+# descendants (including this watcher) before Steam marks the game as stopped.
+# So the watcher's lifetime is tied to the MO2/game Wine processes instead.
+
+log="${XDG_STATE_HOME:-$HOME/.local/state}/cp2077-gamemode.log"
+mkdir -p "$(dirname "$log")"
+
+# Wine processes show their Windows path as cmdline, e.g. "Z:\...\bin\x64\Cyberpunk2077.exe ...".
+# (comm is useless: the game renames its main thread to "GameThread".)
+game_re='^[A-Z]:\\.*\\Cyberpunk2077\.exe'
+session_re='^[A-Z]:\\.*\\(mo2-redirector|ModOrganizer|Cyberpunk2077)\.exe'
+startup_grace=180 # seconds to wait for MO2 to appear before giving up
+
+(
+    declare -A seen=()
+    echo "$(date '+%F %T') watcher started" >"$log"
+
+    waited=0
+    until pgrep -f "$session_re" >/dev/null; do
+        if ((waited >= startup_grace)); then
+            echo "$(date '+%F %T') MO2 never appeared within ${startup_grace}s, giving up" >>"$log"
+            exit 0
+        fi
+        sleep 3
+        ((waited += 3))
+    done
+    echo "$(date '+%F %T') MO2 session detected" >>"$log"
+
+    # Run while MO2 or the game is alive, so relaunching the game from MO2 is also covered.
+    while pgrep -f "$session_re" >/dev/null; do
+        for pid in $(pgrep -f "$game_re"); do
+            [[ -n ${seen[$pid]:-} ]] && continue
+            seen[$pid]=1
+            if gamemoded -r"$pid" >>"$log" 2>&1; then
+                echo "$(date '+%F %T') gamemode requested for pid $pid" >>"$log"
+            else
+                echo "$(date '+%F %T') gamemode request FAILED for pid $pid" >>"$log"
+            fi
+        done
+        sleep 3
+    done
+    echo "$(date '+%F %T') MO2 and game exited, watcher done" >>"$log"
+) </dev/null >/dev/null 2>&1 &
+disown
+
+exec "$@"
