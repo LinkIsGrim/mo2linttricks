@@ -170,6 +170,10 @@ class GitHub:
         blobs = {e["path"]: e["sha"] for e in tree["tree"] if e["type"] == "blob"}  # type: ignore[index]
         return head, tree_sha, blobs
 
+    def get_blob(self, repo: str, sha: str) -> bytes:
+        b = self._req("GET", f"/repos/{repo}/git/blobs/{sha}")
+        return base64.b64decode(b["content"])  # type: ignore[index]
+
     def get_file(self, repo: str, path: str) -> bytes | None:
         quoted = urllib.parse.quote(path)
         try:
@@ -184,6 +188,25 @@ class GitHub:
             b = self._req("GET", f"/repos/{repo}/git/blobs/{d['sha']}")
             return base64.b64decode(b["content"])  # type: ignore[index]
         return None
+
+    def baseline(self, repo: str, snap: Snapshot) -> dict[str, bytes]:
+        """Approximate the remote's managed files for commit messages, cheaply.
+
+        Only mods.json and profile modlist.json are downloaded; other files are
+        represented by the local bytes when the blob hashes match, else a marker.
+        """
+        _, _, remote = self.remote_tree(repo)
+        out: dict[str, bytes] = {}
+        for path, sha in remote.items():
+            if not is_managed(path):
+                continue
+            if path == "mods.json" or path.endswith("/modlist.json"):
+                out[path] = self.get_blob(repo, sha)
+            elif path in snap.files and blob_sha(snap.files[path]) == sha:
+                out[path] = snap.files[path]
+            else:
+                out[path] = b"\0remote:" + sha.encode()
+        return out
 
     def push_snapshot(self, repo: str, snap: Snapshot, message: str) -> str | None:
         """Make the managed part of the repo equal to the snapshot. Returns the new commit sha, or None if unchanged."""
@@ -261,9 +284,16 @@ def describe_changes(old: dict[str, bytes], new: dict[str, bytes]) -> str:
             bits.append("reordered")
         lines.append(f"profile {prof}: {', '.join(bits) or 'changed'}")
 
+    old_dl = {p for p in old if p.startswith("downloads/")}
+    new_dl = {p for p in new if p.startswith("downloads/")}
+    for p in sorted(new_dl - old_dl):
+        lines.append(f"+ downloaded {p[len('downloads/'):-len('.meta')]}")
+    for p in sorted(old_dl - new_dl):
+        lines.append(f"- deleted download {p[len('downloads/'):-len('.meta')]}")
+
     changed_other = sorted(
         p for p in set(old) | set(new)
-        if old.get(p) != new.get(p) and not p.endswith("modlist.json") and p != "mods.json" and not p.startswith("mods/")
+        if old.get(p) != new.get(p) and not p.endswith("modlist.json") and p != "mods.json" and not p.startswith("mods/") and not p.startswith("downloads/")
     )
     if changed_other and not lines:
         lines.append(f"updated {len(changed_other)} file(s)")

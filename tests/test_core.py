@@ -116,6 +116,8 @@ class FakeGitHub:
         if rest.startswith("/git/trees/") and method == "GET":
             t = self.trees[rest.split("/")[-1].split("?")[0]]
             return ok({"truncated": False, "tree": [{"path": p, "sha": s, "type": "blob"} for p, s in t.items()]})
+        if rest.startswith("/git/blobs/") and method == "GET":
+            return ok({"content": base64.b64encode(self.blobs[rest.split("/")[-1]]).decode(), "encoding": "base64"})
         if rest == "/git/blobs" and method == "POST":
             raw = base64.b64decode(data["content"])
             self.blobs[github.blob_sha(raw)] = raw
@@ -173,6 +175,22 @@ class SnapshotTests(unittest.TestCase):
         self.assertIn("downloads/RED4ext-1.27.zip.meta", snap.files)
         self.assertFalse(any("saves" in p for p in snap.files))
 
+    def test_signed_cdn_urls_not_stored(self):
+        (self.info.downloads_dir / "RED4ext-1.27.zip.meta").write_text(
+            DL_META.replace('url="https://files.nexus-cdn.com/x.zip"', 'url="https://supporter-files.nexus-cdn.com/a?expires=1&user_id=42"')
+        )
+        snap = snapshot.build(self.info)
+        self.assertNotIn("downloadUrl", json.loads(snap.files["mods.json"])["RED4ext"])
+        meta = snap.files["downloads/RED4ext-1.27.zip.meta"]
+        self.assertNotIn(b"user_id", meta)
+        self.assertIn(b"fileID=55555", meta)
+
+    def test_hidden_download_kept(self):
+        (self.info.downloads_dir / "RED4ext-1.27.zip.meta").write_text(DL_META.replace("removed=false", "removed=true"))
+        snap = snapshot.build(self.info)
+        self.assertIn("downloads/RED4ext-1.27.zip.meta", snap.files)
+        self.assertEqual(json.loads(snap.files["mods.json"])["RED4ext"]["fileids"], [55555])
+
     def test_snapshot_is_deterministic(self):
         self.assertEqual(snapshot.build(self.info).files, snapshot.build(self.info).files)
 
@@ -193,7 +211,8 @@ class PushTests(unittest.TestCase):
         snap = snapshot.build(self.info)
         self.assertIsNotNone(self.gh.push_snapshot(repo, snap, "first"))
         remote = self.fake.files(repo)
-        self.assertIn("README.md", remote)  # unmanaged files are kept
+        self.assertIn("nexusmods.com/cyberpunk2077/mods/107?tab=files&file_id=91234", remote["README.md"].decode())
+        self.assertIn("| My URL Mod | 2.0 | [link](https://example.com/mymod) |  |", remote["README.md"].decode())
         for p, data in snap.files.items():
             self.assertEqual(remote[p], data)
 
@@ -205,9 +224,19 @@ class PushTests(unittest.TestCase):
         snap2 = snapshot.build(self.info)
         self.assertIsNotNone(self.gh.push_snapshot(repo, snap2, "remove"))
         self.assertNotIn("mods/My URL Mod/meta.ini", self.fake.files(repo))
-        self.assertIn("README.md", self.fake.files(repo))
         msg = github.describe_changes(snap.files, snap2.files)
         self.assertIn("removed My URL Mod", msg)
+
+    def test_baseline_and_messages(self):
+        repo, _ = self.gh.ensure_repo("r", "x")
+        snap = snapshot.build(self.info)
+        self.gh.push_snapshot(repo, snap, "first")
+        base = self.gh.baseline(repo, snap)
+        self.assertEqual(base["mods.json"], snap.files["mods.json"])
+        self.assertEqual(base["README.md"], snap.files["README.md"])
+        self.assertEqual(github.describe_changes(base, snap.files), "Sync modlist")
+        (self.info.downloads_dir / "New.zip.meta").write_text("[General]\nmodID=1\nfileID=2\n")
+        self.assertEqual(github.describe_changes(base, snapshot.build(self.info).files), "+ downloaded New.zip")
 
     def test_ensure_repo_existing(self):
         self.gh.ensure_repo("r", "x")

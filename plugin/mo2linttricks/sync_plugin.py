@@ -185,7 +185,9 @@ class ModlistSync(mobase.IPlugin):
                 if created:
                     qInfo(f"mo2linttricks: created private repo {self._repo}")
             snap: Snapshot = build(info)
-            msg = describe_changes(self._last_files or {}, snap.files) if self._last_files is not None else "Sync modlist"
+            if self._last_files is None:  # first sync this session: compare against GitHub
+                self._last_files = gh.baseline(self._repo, snap)
+            msg = describe_changes(self._last_files, snap.files)
             sha = gh.push_snapshot(self._repo, snap, msg)
             self._last_files = snap.files
             text = f"pushed {sha[:7]} to {self._repo}" if sha else f"{self._repo} already up to date"

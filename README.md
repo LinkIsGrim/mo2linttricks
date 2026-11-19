@@ -36,12 +36,15 @@ When it syncs:
 - once at startup, to catch edits made while MO2 was closed;
 - whenever you run **Tools > mo2linttricks > Sync modlist now**.
 
-Each sync is one commit, made through GitHub's Git Data API, so no git is needed inside Wine. If nothing changed, no commit is made.
+Each sync is one commit, made through GitHub's Git Data API, so no git is needed inside Wine. If nothing changed, no commit is made. Commit messages list what changed (installed, removed, updated, downloaded, toggled, reordered); the first sync of a session compares against what's on GitHub.
 
-Repo layout. Only these paths are managed; anything else you add, such as your own README, is left alone.
+Nexus's temporary, signed download links aren't stored, because they embed your Nexus user id and expire within a day. The mod and file IDs are kept instead.
+
+Repo layout. Only these paths are managed; anything else you add (such as a `NOTES.md`) is left alone.
 
 | Path | Contents |
 |:--|:--|
+| `README.md` | generated: a table of every mod with version, its Nexus file link or source link, and the profiles it's enabled in, plus a list of all Nexus links |
 | `mo2linttricks.json` | game, MO2 version, profile names |
 | `mods.json` | per mod: `source` (`nexus` / `url` / `manual` / `separator`), version, Nexus `modid` + `fileids`, archive name, URLs |
 | `mods/<mod>/meta.ini` | MO2's metadata for the mod (minus the bulky `nexusDescription`) |
