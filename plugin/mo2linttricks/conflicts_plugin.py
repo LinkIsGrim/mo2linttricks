@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import pickle
+import subprocess
 import threading
 from pathlib import Path
 
@@ -63,6 +64,15 @@ PROBLEM_RULE_INCOMPATIBLE = 6
 PROBLEM_RULE_MISSING = 7
 
 RULES_URL = "https://raw.githubusercontent.com/LinkIsGrim/mo2linttricks/main/rules/cyberpunk2077.json"
+# Out-of-process YAML parser (Windows exe; runs under Wine too). Python parsing holds the
+# GIL that MO2's UI thread needs for Python game plugins, so heavy parsing lives elsewhere.
+SCAN_HELPER = Path(__file__).resolve().parent / "bin" / "mo2lt-scan.exe"
+
+
+def _run_helper(cmd: list[str], data: bytes) -> bytes:
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    r = subprocess.run(cmd, input=data, capture_output=True, timeout=300, creationflags=flags, check=True)
+    return r.stdout
 USER_RULES = "mo2linttricks-rules.json"
 
 
@@ -275,6 +285,11 @@ class ConflictModel:
             out["report"] = report
             cache = state["cache"]
             before = {k: v[:2] for k, v in cache.items()}
+            if SCAN_HELPER.exists():
+                try:
+                    tw.prefill_with_helper(state["mods"], cache, SCAN_HELPER, _run_helper)
+                except Exception as e:  # fall back to parsing in Python
+                    qWarning(f"mo2linttricks conflicts: mo2lt-scan failed ({e}); parsing in Python")
             out["tweaks"] = tw.scan(state["mods"], cache)
             out["scripts"] = rs.scan(state["mods"])
             live = {str(p) for _, root in state["mods"] for p in (root / "r6" / "tweaks").rglob("*")}

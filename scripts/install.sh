@@ -23,8 +23,11 @@ if pgrep -f 'ModOrganizer\.exe' >/dev/null; then
 fi
 
 helper="$repo/build/mo2lt-gamemode"
+scanner="$repo/build/mo2lt-scan.exe"
 if command -v go >/dev/null; then
     (cd "$repo/helper" && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o "$helper" ./cmd/mo2lt-gamemode)
+    # Windows build on purpose: MO2's Python starts it as a normal Windows process (Wine or Windows)
+    (cd "$repo/helper" && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o "$scanner" ./cmd/mo2lt-scan)
 fi
 [[ -x "$helper" ]] || { echo "GameMode helper not built (need Go, or a prebuilt build/mo2lt-gamemode)" >&2; exit 1; }
 
@@ -35,6 +38,7 @@ cp -r "$repo/plugin/mo2linttricks/." "$dest/"
 find "$dest" -name __pycache__ -prune -exec rm -rf {} +
 # .exe name on purpose: Wine runs ELF binaries natively, but only resolves them by an .exe name
 cp "$helper" "$dest/bin/mo2lt-gamemode.exe"
+[[ -f "$scanner" ]] && cp "$scanner" "$dest/bin/mo2lt-scan.exe" || echo "note: mo2lt-scan.exe not built; TweakXL files will be parsed in Python (slow)" >&2
 echo "installed plugin -> $dest"
 
 if $patch; then

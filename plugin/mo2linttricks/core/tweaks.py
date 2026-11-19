@@ -288,6 +288,52 @@ def _parse_file(p: Path, cache: ParseCache | None) -> list[tuple[str, Any, str]]
     return parsed
 
 
+def _from_json(v: Any) -> Any:
+    """Values from the mo2lt-scan helper: {"$tag": t, "v": x} back to Tagged."""
+    if isinstance(v, dict):
+        if set(v) == {"$tag", "v"}:
+            return Tagged(v["$tag"], _from_json(v["v"]))
+        return {k: _from_json(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_from_json(x) for x in v]
+    return v
+
+
+def prefill_with_helper(mods_by_priority: list[tuple[str, Path]], cache: ParseCache, helper: Path, run) -> int:
+    """Parse new/changed YAML files with the out-of-process Go helper and store them in `cache`.
+
+    `run(cmd, input_bytes) -> stdout bytes` is injected (subprocess in MO2, fakes in tests).
+    Returns the number of files parsed. Files the helper can't parse are left to Python.
+    """
+    stale_roots: list[str] = []
+    for _mod, root in mods_by_priority:
+        tweaks_dir = root / "r6" / "tweaks"
+        if not tweaks_dir.is_dir():
+            continue
+        for p in tweaks_dir.rglob("*"):
+            if p.suffix.lower() in (".yaml", ".yml") and p.is_file():
+                st = p.stat()
+                hit = cache.get(str(p))
+                if not hit or hit[0] != st.st_mtime_ns or hit[1] != st.st_size:
+                    stale_roots.append(str(root))
+                    break
+    if not stale_roots:
+        return 0
+    out = json.loads(run([str(helper)], json.dumps({"roots": stale_roots}).encode()))
+    n = 0
+    for f in out.get("files", []):
+        if f.get("error"):
+            continue
+        p = Path(f["path"])
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        cache[str(p)] = (st.st_mtime_ns, st.st_size, [(k, _from_json(v), "yaml") for k, v in f["entries"]])
+        n += 1
+    return n
+
+
 def scan(mods_by_priority: list[tuple[str, Path]], cache: ParseCache | None = None) -> TweakScan:
     """mods_by_priority: [(mod name, mod folder)] lowest priority first (exclude the patch mod).
 

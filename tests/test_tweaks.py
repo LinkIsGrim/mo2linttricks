@@ -118,6 +118,31 @@ class TweakTests(unittest.TestCase):
         self.assertFalse(lal.patchable)
 
 
+class HelperTests(unittest.TestCase):
+    """The out-of-process Go parser (build/mo2lt-scan) must agree with the Python parser."""
+
+    HELPER = Path(__file__).resolve().parents[1] / "build" / "mo2lt-scan"
+
+    def test_helper_matches_python(self):
+        if not self.HELPER.exists():
+            self.skipTest("build/mo2lt-scan not built (go build ./helper/cmd/mo2lt-scan)")
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as d:
+            r = Path(d)
+            write(r / "A", "r6/tweaks/a.yaml", ECON + "Price.Arasaka.value: 2.0\nanchor: &x {value: 3}\nItems.Alias: *x\n")
+            write(r / "B", "r6/tweaks/b.yaml", GUN)
+            mods = [("A", r / "A"), ("B", r / "B")]
+            cache: dict = {}
+            run = lambda cmd, data: subprocess.run(cmd, input=data, capture_output=True, check=True).stdout  # noqa: E731
+            self.assertEqual(tweaks.prefill_with_helper(mods, cache, self.HELPER, run), 2)
+            for path, (_m, _s, entries) in cache.items():
+                py = tweaks.parse_yaml(Path(path).read_text())
+                self.assertEqual(tweaks._canon(dict(py)), tweaks._canon({k: v for k, v, _src in entries}), path)
+            self.assertIsInstance(dict((k, v) for k, v, _ in cache[str(r / "A/r6/tweaks/a.yaml")][2])["Price.TechWeapon.value"], float)
+            self.assertEqual(tweaks.prefill_with_helper(mods, cache, self.HELPER, run), 0)  # all cached now
+
+
 class RedscriptTests(unittest.TestCase):
     def test_replacements(self):
         with tempfile.TemporaryDirectory() as d:
