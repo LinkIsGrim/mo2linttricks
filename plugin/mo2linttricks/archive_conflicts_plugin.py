@@ -135,7 +135,8 @@ class ArchiveModel:
     def fully_overridden(self) -> list[ac.ArchiveResult]:
         if not self.report:
             return []
-        return [r for r in self.report.order if r.files and len(r.loses) == r.files]
+        rep = self.report
+        return [r for r in rep.order if r.files and len(r.loses) == r.files and rep.real_counts(r)[1]]
 
 
 MODEL = ArchiveModel()
@@ -227,16 +228,16 @@ class ArchiveConflictsDiagnose(mobase.IPluginDiagnose):
         if MODEL.fully_overridden():
             problems.append(PROBLEM_OVERRIDDEN)
         notify = self._organizer.pluginSetting(DIAG_NAME, "notify_conflicts") if self._organizer else True
-        if MODEL.report.conflicts and (notify is None or notify):
+        if MODEL.report.real_conflicts and (notify is None or notify):
             problems.append(PROBLEM_CONFLICTS)
         return problems
 
     def shortDescription(self, key: int) -> str:
         if key == PROBLEM_OVERRIDDEN:
             return f"{len(MODEL.fully_overridden())} .archive file(s) are completely overridden by other mods"
-        n = len(MODEL.report.conflicts) if MODEL.report else 0
-        a = len(MODEL.report.conflicting_archives) if MODEL.report else 0
-        return f"{n} game file(s) are replaced by more than one .archive ({a} archives involved)"
+        n = len(MODEL.report.real_conflicts) if MODEL.report else 0
+        a = len(MODEL.report.really_conflicting_archives) if MODEL.report else 0
+        return f"{n} game file(s) are replaced differently by more than one .archive ({a} archives involved)"
 
     def fullDescription(self, key: int) -> str:
         rep = MODEL.report
@@ -250,14 +251,19 @@ class ArchiveConflictsDiagnose(mobase.IPluginDiagnose):
                 f"<ul>{rows}</ul><p>Load order: {MODEL.order_source}.</p>"
                 "<p>Details: Tools &gt; mo2linttricks &gt; Archive conflicts.</p>"
             )
-        top = sorted(rep.conflicting_archives, key=lambda r: -(len(r.wins) + len(r.loses)))[:15]
+        arch = rep.really_conflicting_archives
+        top = sorted(arch, key=lambda r: -sum(rep.real_counts(r)))[:15]
         rows = "".join(
-            f"<li><b>{r.source.name}</b> ({r.source.mod}): wins {len(r.wins)}, loses {len(r.loses)}</li>" for r in top
+            f"<li><b>{r.source.name}</b> ({r.source.mod}): wins {rep.real_counts(r)[0]}, loses {rep.real_counts(r)[1]}</li>"
+            for r in top
         )
+        more = f"<p>...and {len(arch) - len(top)} more.</p>" if len(arch) > len(top) else ""
+        same = f" {len(rep.identical)} more contested file(s) are identical in every archive and are not counted." if rep.identical else ""
         return (
-            "<p>Several .archive mods contain the same game files; the first one in load order wins. "
-            "Often intended (patches, compatibility archives), but worth checking.</p>"
-            f"<ul>{rows}</ul><p>Load order: {MODEL.order_source}.</p>"
+            "<p>Several .archive mods contain different versions of the same game files; the first one in load order "
+            "wins and the others' version is not used. Often intended (patches, compatibility archives), but worth "
+            f"checking.{same}</p>"
+            f"<ul>{rows}</ul>{more}<p>Load order: {MODEL.order_source}.</p>"
             "<p>Details: Tools &gt; mo2linttricks &gt; Archive conflicts. "
             "Disable this notice in the plugin settings (notify_conflicts).</p>"
         )
@@ -287,10 +293,13 @@ class ArchiveConflictsDialog(QDialog):
         self._info.setWordWrap(True)
         lay.addWidget(self._info)
         self._all = QCheckBox("Show archives without conflicts")
+        self._same = QCheckBox("Show identical files (harmless duplicates)")
+        self._same.toggled.connect(self._render)
         self._all.toggled.connect(self._render)
         lay.addWidget(self._all)
+        lay.addWidget(self._same)
         self._tree = QTreeWidget()
-        self._tree.setHeaderLabels(["#", "Archive / file", "Mod", "Wins", "Loses"])
+        self._tree.setHeaderLabels(["#", "Archive / file", "Mod", "Wins", "Loses", "Identical"])
         header = self._tree.header()
         if header:
             header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -324,36 +333,54 @@ class ArchiveConflictsDialog(QDialog):
         if not rep:
             self._info.setText("No scan yet.")
             return
-        conflicting = rep.conflicting_archives
+        conflicting = rep.really_conflicting_archives
         errors = [r for r in rep.order if r.error]
         self._info.setText(
-            f"<b>{len(rep.order)}</b> archives, <b>{len(conflicting)}</b> with conflicts, "
-            f"<b>{len(rep.conflicts)}</b> contested files. Load order: {MODEL.order_source}. "
+            f"<b>{len(rep.order)}</b> archives, <b>{len(conflicting)}</b> with real conflicts, "
+            f"<b>{len(rep.real_conflicts)}</b> files that differ between archives "
+            f"(+{len(rep.identical)} identical duplicates). Load order: {MODEL.order_source}. "
             "First in load order wins."
             + (f"<br><span style='color:#c33'>{len(errors)} archive(s) could not be read.</span>" if errors else "")
         )
+        show_same = self._same.isChecked()
+        grey = Qt.GlobalColor.gray
         for i, r in enumerate(rep.order):
-            if not (r.wins or r.loses or r.error or self._all.isChecked()):
+            wins, loses = rep.real_counts(r)
+            same = len(r.wins) + len(r.loses) - wins - loses
+            if not (wins or loses or r.error or self._all.isChecked() or (show_same and same)):
                 continue
-            top = QTreeWidgetItem([str(i), r.source.name, r.source.mod, str(len(r.wins)), str(len(r.loses))])
+            top = QTreeWidgetItem([str(i), r.source.name, r.source.mod, str(wins), str(loses), str(same)])
+            if not (wins or loses):
+                for c in range(6):
+                    top.setForeground(c, grey)
             if r.error:
                 top.setText(1, f"{r.source.name}  [unreadable: {r.error}]")
             if r.files and len(r.loses) == r.files:
                 top.setToolTip(1, "every file in this archive is overridden")
                 top.setForeground(1, Qt.GlobalColor.red)
             for h in r.wins:
+                if h in rep.identical and not show_same:
+                    continue
                 losers = ", ".join(f"{rep.order[j].source.name} ({rep.order[j].source.mod})" for j in rep.conflicts[h][1:])
-                top.addChild(QTreeWidgetItem(["", f"wins  {rep.name(h)}", f"over {losers}", "", ""]))
+                child = QTreeWidgetItem(["", f"wins  {rep.name(h)}", f"over {losers}", "", "", "same" if h in rep.identical else ""])
+                if h in rep.identical:
+                    child.setForeground(1, grey)
+                top.addChild(child)
             for h in r.loses:
+                if h in rep.identical and not show_same:
+                    continue
                 w = rep.order[rep.conflicts[h][0]]
-                top.addChild(QTreeWidgetItem(["", f"loses {rep.name(h)}", f"to {w.source.name} ({w.source.mod})", "", ""]))
+                child = QTreeWidgetItem(["", f"loses {rep.name(h)}", f"to {w.source.name} ({w.source.mod})", "", "", "same" if h in rep.identical else ""])
+                if h in rep.identical:
+                    child.setForeground(1, grey)
+                top.addChild(child)
             self._tree.addTopLevelItem(top)
 
     def _resolve_names(self) -> None:
         rep = MODEL.report
         if not rep:
             return
-        wanted = {h for h in rep.conflicts if h not in rep.names}
+        wanted = {h for h in rep.conflicts if h not in rep.names}  # identical ones too, for the "show identical" view
         if not wanted:
             QMessageBox.information(self, "mo2linttricks", "All contested files already have names.")
             return

@@ -12,22 +12,30 @@ from core import archive_conflicts as ac  # noqa: E402
 from core import red4archive as ra  # noqa: E402
 
 
-def make_archive(path: Path, names: list[str], lxrs: bool = True, compressed_lxrs: bool = False) -> None:
-    """Write a minimal but structurally valid RDAR archive (header, LXRS, index, entries)."""
+def make_archive(path: Path, names: list[str], lxrs: bool = True, compressed_lxrs: bool = False, data: dict[str, bytes] | None = None) -> None:
+    """Write a minimal but structurally valid RDAR archive (header, LXRS, index, entries, segments, data)."""
     hashes = [ra.fnv1a64(n) for n in names]
+    contents = [(data or {}).get(n, n.encode()) for n in names]
     custom = b""
     if lxrs:
         blob = b"".join(n.encode() + b"\0" for n in names)
         zsize = len(blob) - 1 if compressed_lxrs else len(blob)
         custom = struct.pack("<IIIIi", ra.LXRS_MAGIC, 1, len(blob), zsize, len(names)) + blob[:zsize]
-    index_pos = ra.HEADER_EXTENDED_SIZE + len(custom)
-    entries = b"".join(ra.ENTRY.pack(h, 0, 1, 0, 1, 0, 0, b"\0" * 20) for h in hashes)
-    index = ra.INDEX.pack(8, len(entries), 0, len(hashes), 0, 0) + entries
+    data_pos = ra.HEADER_EXTENDED_SIZE + len(custom)
+    blob = b"".join(contents)
+    index_pos = data_pos + len(blob)
+    entries = b"".join(ra.ENTRY.pack(h, 0, 1, i, i + 1, 0, 0, b"\x11" * 20) for i, h in enumerate(hashes))
+    segs, off = b"", data_pos
+    for c in contents:
+        segs += ra.SEGMENT.pack(off, len(c), len(c))
+        off += len(c)
+    index = ra.INDEX.pack(8, len(entries), 0, len(hashes), len(hashes), 0) + entries + segs
     header = ra.HEADER.pack(ra.HEADER_MAGIC, 12, index_pos, len(index), 0, 0, index_pos + len(index))
     buf = io.BytesIO()
     buf.write(header + struct.pack("<I", len(custom)))
     buf.write(b"\0" * (ra.HEADER_EXTENDED_SIZE - buf.tell()))
     buf.write(custom)
+    buf.write(blob)
     buf.write(index)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(buf.getvalue())
@@ -88,6 +96,16 @@ class ConflictTests(unittest.TestCase):
         self.assertEqual(by["zzGun.archive"].loses, [shared])
         self.assertEqual(rep.name(shared), r"base\shared.mesh")
         self.assertEqual(len(rep.conflicting_archives), 2)
+
+    def test_identical_vs_different(self):
+        same, diff = r"base\same.ent", r"base\diff.ent"
+        make_archive(self.mods / "A" / "archive/pc/mod/a.archive", [same, diff], data={same: b"X", diff: b"one"})
+        make_archive(self.mods / "B" / "archive/pc/mod/b.archive", [same, diff], data={same: b"X", diff: b"two!"})
+        rep = ac.compute(ac.load_order(ac.visible_archives([("A", self.mods / "A"), ("B", self.mods / "B")]), None))
+        self.assertEqual(rep.identical, {ra.fnv1a64(same)})
+        self.assertEqual(list(rep.real_conflicts), [ra.fnv1a64(diff)])
+        self.assertEqual(rep.real_counts(rep.order[0]), (1, 0))
+        self.assertEqual(rep.real_counts(rep.order[1]), (0, 1))
 
     def test_modlist_txt_order(self):
         order = ac.load_order(ac.visible_archives(self.layers), ["zzGun.archive", "missing.archive"])

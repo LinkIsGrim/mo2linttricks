@@ -89,6 +89,8 @@ The first archive in load order wins a contested file.
 
 File names come from each archive's own name list (when it isn't Kraken-compressed), and on request from CDPR's resource hash list. That list is 30 MB, downloaded from red4lib at a pinned commit and checked against a SHA-256 hash. Only the hashes you need are looked up, and the results are cached in MO2's plugin data folder. Names that can't be resolved are shown as hashes.
 
+Contested files whose content is byte-for-byte identical in every archive (common when related mods each ship the same shared file) are detected and don't count as conflicts. The index's own SHA-1 field can't be used for this, because WolvenKit writes one constant value for every file, so the stored data is compared instead.
+
 Notifications: "fully overridden archive" (every file loses, so the archive has no effect) always appears. "Any conflicts" can be turned off with `notify_conflicts`.
 
 ## Development

@@ -19,7 +19,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .red4archive import ArchiveError, read_index
+from .red4archive import ArchiveError, content_signature, read_index
 
 
 @dataclass
@@ -36,6 +36,7 @@ class ArchiveResult:
     wins: list[int] = field(default_factory=list)
     loses: list[int] = field(default_factory=list)
     error: str = ""
+    segments: dict[int, list[tuple[int, int, int]]] = field(default_factory=dict, repr=False)
 
 
 @dataclass
@@ -44,10 +45,22 @@ class ConflictReport:
     conflicts: dict[int, list[int]]  # file hash -> indexes into order, winner first
     names: dict[int, str]  # resolved names (from archives' LXRS footers, plus name DB)
     unnamed_compressed: bool = False
+    identical: set[int] = field(default_factory=set)  # contested hashes whose content is the same everywhere
 
     @property
     def conflicting_archives(self) -> list[ArchiveResult]:
         return [a for a in self.order if a.wins or a.loses]
+
+    @property
+    def real_conflicts(self) -> dict[int, list[int]]:
+        return {h: i for h, i in self.conflicts.items() if h not in self.identical}
+
+    def real_counts(self, r: ArchiveResult) -> tuple[int, int]:
+        return (sum(h not in self.identical for h in r.wins), sum(h not in self.identical for h in r.loses))
+
+    @property
+    def really_conflicting_archives(self) -> list[ArchiveResult]:
+        return [a for a in self.order if any(self.real_counts(a))]
 
     def name(self, h: int) -> str:
         return self.names.get(h, f"{h:016x}")
@@ -107,6 +120,7 @@ def compute(order: list[ArchiveSource]) -> ConflictReport:
             res.error = str(e)
             continue
         res.files = len(idx.hashes)
+        res.segments = idx.segments
         names.update(idx.names)
         compressed |= idx.names_compressed
         for h in idx.hashes:
@@ -117,10 +131,19 @@ def compute(order: list[ArchiveSource]) -> ConflictReport:
         results[idxs[0]].wins.append(h)
         for j in idxs[1:]:
             results[j].loses.append(h)
+    identical = set()
+    for h, idxs in conflicts.items():
+        try:
+            sigs = {content_signature(results[i].source.path, results[i].segments[h]) for i in idxs}
+        except OSError:
+            continue
+        if len(sigs) == 1:
+            identical.add(h)
     for r in results:
         r.wins.sort()
         r.loses.sort()
-    return ConflictReport(results, conflicts, names, compressed)
+        r.segments = {}
+    return ConflictReport(results, conflicts, names, compressed, identical)
 
 
 # --- vanilla file names ------------------------------------------------------------
