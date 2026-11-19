@@ -117,6 +117,15 @@ The patch is the mod **mo2linttricks Patch**; keep it last. It contains `r6/twea
 
 YAML and `.tweak` files are both parsed. Package-relative names follow TweakXL's `RedReader`. Only simple `.tweak` literals can be copied into the patch; complex ones are shown but can't be chosen. PyYAML 6.0.2 (pure Python, MIT) is vendored in `core/_vendor`.
 
+### In the mod list
+
+MO2's plugin API can't add mod-list columns, so the plugin wraps the Qt delegate that draws the **Conflicts** column. MO2's own icons stay on the left; the plugin adds badges on the right:
+
+- **A** archives, **T** TweakXL values, **S** redscript, **R** load-order rules.
+- **Red** means it needs attention: an unresolved TweakXL value, a fully overridden archive, a differing redscript replacement, or a broken rule. **Amber** means resolved or expected.
+
+Hovering adds the details to MO2's tooltip. Turn it off with `show_in_mod_list`.
+
 ### redscript
 
 The resolver reports functions that several mods replace with `@replaceMethod` or `@replaceGlobal`; only one replacement runs. Byte-identical replacements are marked harmless. `@wrapMethod` combines with other mods, so it isn't listed.

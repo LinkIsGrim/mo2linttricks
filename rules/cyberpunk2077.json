@@ -5,57 +5,116 @@
   "mods": {
     "nexus:23219": {
       "name": "LONGER LOCKDOWN - Act 1 Extended",
-      "load_after": ["nexus:13271", "nexus:23290"],
+      "load_after": [
+        "nexus:13271",
+        "nexus:23290"
+      ],
       "note": "Author: Live A Little and Take a Breather are 'Tested/Compatible (Give my mod priority)'.",
       "source": "https://www.nexusmods.com/cyberpunk2077/mods/23219"
     },
     "nexus:23852": {
       "name": "HALTED HANAKO - Postpone NOCTURNE OP55N1",
-      "load_after": ["nexus:13271"],
+      "load_after": [
+        "nexus:13271"
+      ],
       "note": "Author: 'Should pair well with Live A Little. Just give my mod priority.'",
       "source": "https://www.nexusmods.com/cyberpunk2077/mods/23852"
     },
     "nexus:13271:130530": {
       "name": "Live A Little - OPLI compatibility add-on",
-      "load_after": ["nexus:21623", "nexus:13271"],
+      "load_after": [
+        "nexus:21623",
+        "nexus:13271"
+      ],
       "note": "Live A Little author: archive order should be 1. this compatibility file, 2. OPLI, 3. LiveALittle PL timers. Install it as its own MO2 mod so it can be ordered separately.",
       "source": "https://www.nexusmods.com/cyberpunk2077/mods/13271"
     },
     "nexus:21623": {
       "name": "OPLI - Overhauled Phantom Liberty Integration",
-      "load_after": ["nexus:13271"],
+      "load_after": [
+        "nexus:13271"
+      ],
       "note": "Live A Little author: OPLI's archive must have priority over Live A Little (q302 call phase).",
       "source": "https://www.nexusmods.com/cyberpunk2077/mods/13271"
     },
     "nexus:23290": {
       "name": "Take a Breather - Pace and Reputation Overhaul",
       "incompatible_with": [
-        {"id": "nexus:24604", "note": "Longer Lockdown author: Take a Breather is not compatible with Immersive Gigs."}
+        {
+          "id": "nexus:24604",
+          "note": "Longer Lockdown author: Take a Breather is not compatible with Immersive Gigs."
+        }
       ],
       "source": "https://www.nexusmods.com/cyberpunk2077/mods/23219"
     },
     "nexus:7831": {
       "name": "Deceptious Quest Core",
-      "load_before": ["nexus:32903", "nexus:19679", "nexus:15708", "nexus:18318"],
+      "load_before": [
+        "nexus:32903",
+        "nexus:19679",
+        "nexus:15708",
+        "nexus:18318"
+      ],
       "note": "Inferred: the framework's archive is named zDeceptiousQuestCore so that mods built on it (RippersXL, VendorsXL, Parking Spots Enhanced, Deceptious Bug Fixes) override its shared files.",
       "source": "archive naming"
     },
     "nexus:30771": {
       "name": "Gunsensical Reloaded",
-      "requires": ["nexus:4197", "nexus:1511", "nexus:4198"],
+      "requires": [
+        "nexus:4197",
+        "nexus:1511",
+        "nexus:4198"
+      ],
       "note": "Inferred from its files: .yaml/.tweak (TweakXL), .reds (redscript), .xl (ArchiveXL); the author says to install all requirements.",
       "source": "https://www.nexusmods.com/cyberpunk2077/mods/30771"
     },
     "nexus:22741": {
       "name": "Weapons Improved",
-      "requires": ["nexus:107", "nexus:4197"],
+      "requires": [
+        "nexus:107",
+        "nexus:4197"
+      ],
       "incompatible_with": [
-        {"id": "nexus:30771", "note": "Both are full weapon rebalances of the same stats; use one."}
+        {
+          "id": "nexus:30771",
+          "note": "Both are full weapon rebalances of the same stats; use one."
+        }
       ],
       "note": "Requires CET (stated) and TweakXL (its r6/tweaks files).",
       "source": "https://www.nexusmods.com/cyberpunk2077/mods/22741"
     },
-    "nexus:4197": {"name": "TweakXL", "requires": ["nexus:2380"], "source": "https://www.nexusmods.com/cyberpunk2077/mods/4197"},
-    "nexus:4198": {"name": "ArchiveXL", "requires": ["nexus:2380"], "source": "https://www.nexusmods.com/cyberpunk2077/mods/4198"}
+    "nexus:4197": {
+      "name": "TweakXL",
+      "requires": [
+        "nexus:2380"
+      ],
+      "source": "https://www.nexusmods.com/cyberpunk2077/mods/4197"
+    },
+    "nexus:4198": {
+      "name": "ArchiveXL",
+      "requires": [
+        "nexus:2380"
+      ],
+      "source": "https://www.nexusmods.com/cyberpunk2077/mods/4198"
+    },
+    "nexus:16300": {
+      "name": "Dark Future - Urban Survival Gameplay",
+      "incompatible_with": [
+        {
+          "id": "nexus:12607",
+          "note": "Dark Future author: incompatible with Santa Muerte - Death Alternative (prevents correctly re-entering combat)."
+        }
+      ],
+      "requires": [
+        "nexus:107",
+        "nexus:1511",
+        "nexus:7780",
+        "nexus:4197",
+        "nexus:4198",
+        "nexus:4885"
+      ],
+      "note": "Requirements inferred from its files (.lua CET, .reds redscript + Codeware, .yaml TweakXL, .xl ArchiveXL) and its settings living in Mod Settings. With Immersive Crafting Access set Dark Future's 'Limit Crafting to Stash' Off.",
+      "source": "https://www.nexusmods.com/cyberpunk2077/mods/16300"
+    }
   }
 }

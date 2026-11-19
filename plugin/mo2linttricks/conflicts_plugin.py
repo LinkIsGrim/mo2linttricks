@@ -47,6 +47,7 @@ from .core import redscript as rs
 from .core import rules as R
 from .core import tweaks as tw
 from .core.http import Transport
+from .modlist_badges import Issue, ModListBadges
 from .sync_plugin import NAME as SYNC_NAME, VERSION
 
 GAME = "cyberpunk2077"
@@ -101,6 +102,8 @@ class ConflictModel:
         self._fetched = _Fetched()
         self._fetched.done.connect(self._rules_fetched)
         self.listeners: list = []
+        self.mod_issues: dict[str, list[Issue]] = {}
+        self.badges = ModListBadges(lambda name: self.mod_issues.get(name, []))
         self._timer = QTimer()
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.rescan_async)
@@ -313,8 +316,69 @@ class ConflictModel:
         for key in ("rules", "rules_report", "report", "tweaks", "scripts"):
             if key in out:
                 setattr(self, key, out[key])
+        try:
+            self.mod_issues = self._build_issues()
+        except Exception as e:
+            qWarning(f"mo2linttricks conflicts: mod list badges: {e}")
+        self.badges.refresh()
         for cb in list(self.listeners):
             cb()
+
+    def _build_issues(self) -> dict[str, list[Issue]]:
+        """Per-mod summary for the mod-list badges and their tooltips."""
+        out: dict[str, list[Issue]] = {}
+
+        def add(mod: str, issue: Issue) -> None:
+            out.setdefault(mod, []).append(issue)
+
+        rep = self.report
+        if rep:
+            overridden = {id(r) for r in self.fully_overridden()}
+            for r in rep.order:
+                wins, loses = rep.real_counts(r)
+                if not (wins or loses):
+                    continue
+                rivals = sorted(
+                    {rep.order[j].source.mod for h in r.wins + r.loses if h not in rep.identical for j in rep.conflicts[h]}
+                    - {r.source.mod}
+                )
+                text = f"{r.source.name}: wins {wins}, loses {loses} (vs {', '.join(rivals[:4])}{'...' if len(rivals) > 4 else ''})"
+                if id(r) in overridden:
+                    text += " - every file overridden, the archive has no effect"
+                add(r.source.mod, Issue("A", id(r) in overridden, text))
+        root = self.patch_root()
+        patched = tw.patched_keys(root) if root else set()
+        _unhandled, outdated = self.patch_state()
+        per_mod: dict[str, list[str]] = {}
+        unresolved: dict[str, int] = {}
+        for c in self.tweaks.real:
+            done = c.key in patched and not outdated
+            for v in c.values:
+                per_mod.setdefault(v.mod, []).append(c.key)
+                if not done:
+                    unresolved[v.mod] = unresolved.get(v.mod, 0) + 1
+        for mod, keys in per_mod.items():
+            n_open = unresolved.get(mod, 0)
+            status = f"{n_open} not resolved by the patch" if n_open else "all resolved by mo2linttricks Patch"
+            add(mod, Issue("T", bool(n_open), f"{len(keys)} TweakDB value(s) also set by other mods ({status}), e.g. {keys[0]}"))
+        for sc in self.scripts:
+            if sc.identical:
+                continue
+            mods = sorted({r.mod for r in sc.replacements})
+            for m in mods:
+                add(m, Issue("S", True, f"{sc.target} is also replaced by {', '.join(x for x in mods if x != m)}; only one runs"))
+        rr = self.rules_report
+        for e in rr.violations:
+            add(e.after, Issue("R", True, f"should be below {e.before} ({e.rules.note or e.rule_key})"))
+            add(e.before, Issue("R", True, f"should be above {e.after}"))
+        for b in rr.bottom_violations:
+            add(b, Issue("R", True, "should be at the bottom of the list"))
+        for a, b, note in rr.incompatible:
+            add(a, Issue("R", True, f"incompatible with {b}: {note}"))
+            add(b, Issue("R", True, f"incompatible with {a}: {note}"))
+        for m, req in rr.missing:
+            add(m, Issue("R", True, f"requires {req}, not installed or not enabled"))
+        return out
 
     def rescan(self) -> None:
         """Scan now and wait (dialog/user actions; fast once the parse cache is warm)."""
@@ -462,7 +526,14 @@ class ConflictsDiagnose(mobase.IPluginDiagnose):
         self._organizer = organizer
         MODEL.attach(organizer)
         MODEL.listeners.append(self._invalidate)
+        organizer.onUserInterfaceInitialized(self._ui_ready)
         return True
+
+    def _ui_ready(self, window) -> None:
+        enabled = self._organizer.pluginSetting(DIAG_NAME, "show_in_mod_list") if self._organizer else True
+        if (enabled is None or enabled) and MODEL.applies():
+            if not MODEL.badges.install(window):
+                qWarning("mo2linttricks: could not find MO2's mod list view; badges disabled")
 
     def name(self) -> str:
         return DIAG_NAME
@@ -486,6 +557,7 @@ class ConflictsDiagnose(mobase.IPluginDiagnose):
         return [
             mobase.PluginSetting("notify_archive_conflicts", "Notify about any .archive conflicts, not only fully overridden archives", True),
             mobase.PluginSetting("rules_url", "Community load-order rules (JSON, fetched on startup)", RULES_URL),
+            mobase.PluginSetting("show_in_mod_list", "Show conflict badges (A/T/S/R) in the mod list's Conflicts column (restart MO2)", True),
         ]
 
     def _enabled(self) -> bool:
