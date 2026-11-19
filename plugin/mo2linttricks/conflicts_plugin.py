@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import pickle
 import threading
 from pathlib import Path
 
@@ -69,6 +70,10 @@ class _Fetched(QObject):
     done = pyqtSignal(str)
 
 
+class _Scanned(QObject):
+    done = pyqtSignal(object)
+
+
 class ConflictModel:
     """One scan shared by the diagnose plugin and the dialog, redone when mods change."""
 
@@ -88,7 +93,14 @@ class ConflictModel:
         self.listeners: list = []
         self._timer = QTimer()
         self._timer.setSingleShot(True)
-        self._timer.timeout.connect(self.rescan)
+        self._timer.timeout.connect(self.rescan_async)
+        self._scanned = _Scanned()
+        self._scanned.done.connect(self._apply)
+        self._scanned.done.connect(lambda _o: self._scan_finished())
+        self._scan_lock = threading.Lock()
+        self._scan_thread: threading.Thread | None = None
+        self._scan_pending = False
+        self._parse_cache: dict | None = None
 
     def attach(self, organizer: mobase.IOrganizer) -> None:
         if self.organizer:
@@ -216,29 +228,108 @@ class ConflictModel:
                 out.append(R.read_local_mod(name, Path(mod.absolutePath()), enabled))
         return out
 
-    def rescan(self) -> None:
-        if not self.applies():
-            return
+    # --- scanning: collect MO2 state on the UI thread, compute anywhere, apply on the UI thread ---
+
+    def _cache_path(self) -> Path:
+        assert self.organizer
+        return _data_dir(self.organizer) / "tweak-parse-cache.pickle"
+
+    def _load_cache(self) -> dict:
+        if self._parse_cache is None:
+            try:
+                with open(self._cache_path(), "rb") as f:
+                    data = pickle.load(f)  # our own cache file, written below
+                self._parse_cache = data if isinstance(data, dict) else {}
+            except Exception:
+                self._parse_cache = {}
+        return self._parse_cache
+
+    def _collect(self) -> dict:
+        mods = self._active_mods()
+        modlist, order_source = self._modlist(mods)
+        return {
+            "local": self._local_mods(),
+            "mods": mods,
+            "modlist": modlist,
+            "order_source": order_source,
+            "layers": self._archive_layers(mods),
+            "community": self.community_rules_path(),
+            "user": self.user_rules_path(),
+            "names": load_name_cache(self.organizer),  # type: ignore[arg-type]
+            "cache_path": self._cache_path(),
+            "cache": self._load_cache(),
+        }
+
+    @staticmethod
+    def _compute(state: dict) -> dict:
+        out: dict = {"local": state["local"], "mods": state["mods"], "order_source": state["order_source"]}
         try:
-            self.local = self._local_mods()
-            self.rules = R.merge(R.load_file(self.community_rules_path(), "community"), R.load_file(self.user_rules_path(), "user"))
-            self.rules_report = R.check(self.local, self.rules)
+            rules = R.merge(R.load_file(state["community"], "community"), R.load_file(state["user"], "user"))
+            out["rules"] = rules
+            out["rules_report"] = R.check(state["local"], rules)
         except Exception as e:
-            qWarning(f"mo2linttricks rules: check failed: {e}")
+            out["error"] = f"rules check failed: {e}"
         try:
-            self.mods = self._active_mods()
-            modlist, self.order_source = self._modlist(self.mods)
-            order = ac.load_order(ac.visible_archives(self._archive_layers(self.mods)), modlist)
-            report = ac.compute(order)
-            report.names.update(load_name_cache(self.organizer))  # type: ignore[arg-type]
-            self.report = report
-            self.tweaks = tw.scan(self.mods)
-            self.scripts = rs.scan(self.mods)
+            report = ac.compute(ac.load_order(ac.visible_archives(state["layers"]), state["modlist"]))
+            report.names.update(state["names"])
+            out["report"] = report
+            cache = state["cache"]
+            before = {k: v[:2] for k, v in cache.items()}
+            out["tweaks"] = tw.scan(state["mods"], cache)
+            out["scripts"] = rs.scan(state["mods"])
+            live = {str(p) for _, root in state["mods"] for p in (root / "r6" / "tweaks").rglob("*")}
+            for k in [k for k in cache if k not in live]:
+                del cache[k]  # files of removed/disabled mods
+            if {k: v[:2] for k, v in cache.items()} != before:  # something was (re)parsed or removed
+                tmp = state["cache_path"].with_suffix(".tmp")
+                with open(tmp, "wb") as f:
+                    pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+                tmp.replace(state["cache_path"])
         except Exception as e:
-            qWarning(f"mo2linttricks conflicts: scan failed: {e}")
-            return
+            out["error"] = f"scan failed: {e}"
+        return out
+
+    def _apply(self, out: dict) -> None:
+        if out.get("error"):
+            qWarning(f"mo2linttricks conflicts: {out['error']}")
+        self.local = out["local"]
+        self.mods = out["mods"]
+        self.order_source = out["order_source"]
+        for key in ("rules", "rules_report", "report", "tweaks", "scripts"):
+            if key in out:
+                setattr(self, key, out[key])
         for cb in list(self.listeners):
             cb()
+
+    def rescan(self) -> None:
+        """Scan now and wait (dialog/user actions; fast once the parse cache is warm)."""
+        if not self.applies():
+            return
+        with self._scan_lock:
+            state = self._collect()
+            self._apply(self._compute(state))
+
+    def rescan_async(self) -> None:
+        """Scan in a background thread so MO2's UI never blocks (startup, mod list changes)."""
+        if not self.applies():
+            return
+        if self._scan_thread and self._scan_thread.is_alive():
+            self._scan_pending = True
+            return
+        state = self._collect()
+
+        def run() -> None:
+            with self._scan_lock:
+                result = self._compute(state)
+            self._scanned.done.emit(result)
+
+        self._scan_thread = threading.Thread(target=run, daemon=True)
+        self._scan_thread.start()
+
+    def _scan_finished(self) -> None:
+        if self._scan_pending:
+            self._scan_pending = False
+            self.invalidate()
 
     # --- archive order preview --------------------------------------------------------------
 

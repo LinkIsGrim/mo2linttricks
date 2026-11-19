@@ -269,8 +269,31 @@ class TweakScan:
         return [c for c in self.conflicts if not c.identical]
 
 
-def scan(mods_by_priority: list[tuple[str, Path]]) -> TweakScan:
-    """mods_by_priority: [(mod name, mod folder)] lowest priority first (exclude the patch mod)."""
+ParseCache = dict  # str(path) -> (mtime_ns, size, [(key, value, source)])
+
+
+def _parse_file(p: Path, cache: ParseCache | None) -> list[tuple[str, Any, str]]:
+    st = p.stat()
+    key = str(p)
+    hit = cache.get(key) if cache is not None else None
+    if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+        return hit[2]
+    text = p.read_text(encoding="utf-8", errors="replace")
+    if p.suffix.lower() == ".tweak":
+        parsed: list[tuple[str, Any, str]] = [(k, raw, "tweak") for k, raw in parse_tweak(text)]
+    else:
+        parsed = [(k, v, "yaml") for k, v in parse_yaml(text)]
+    if cache is not None:
+        cache[key] = (st.st_mtime_ns, st.st_size, parsed)
+    return parsed
+
+
+def scan(mods_by_priority: list[tuple[str, Path]], cache: ParseCache | None = None) -> TweakScan:
+    """mods_by_priority: [(mod name, mod folder)] lowest priority first (exclude the patch mod).
+
+    `cache` (optional, mutated) maps file path -> parse result, keyed by mtime and size, so a
+    rescan only parses files that changed: parsing ~1000 YAML files in pure Python takes ~25 s.
+    """
     by_key: dict[str, list[TweakValue]] = {}
     result = TweakScan()
     for mod, root in mods_by_priority:
@@ -283,14 +306,9 @@ def scan(mods_by_priority: list[tuple[str, Path]]) -> TweakScan:
                 continue
             rel = str(p.relative_to(root)).replace("\\", "/")
             try:
-                text = p.read_text(encoding="utf-8", errors="replace")
-                if suffix == ".tweak":
-                    for key, raw in parse_tweak(text):
-                        tv = TweakValue(mod, rel, file_group(p), raw, "tweak", convert_tweak_value(raw) is not None)
-                        by_key.setdefault(key, []).append(tv)
-                else:
-                    for key, val in parse_yaml(text):
-                        by_key.setdefault(key, []).append(TweakValue(mod, rel, file_group(p), val, "yaml"))
+                for key, val, source in _parse_file(p, cache):
+                    patchable = source == "yaml" or convert_tweak_value(val) is not None
+                    by_key.setdefault(key, []).append(TweakValue(mod, rel, file_group(p), val, source, patchable))
             except Exception as e:  # a broken file shouldn't hide every other conflict
                 result.errors.append(f"{mod}: {rel}: {e}")
     for key, vals in sorted(by_key.items()):
