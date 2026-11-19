@@ -5,6 +5,7 @@ Mod Organizer 2 plugins for Linux setups made with [MO2-LINT](https://github.com
 - **Modlist Sync**: mirrors your modlist to a private GitHub repo, `mo2-mods-<game>`, automatically: load order, enabled state, and where every mod came from (Nexus mod and file IDs, URLs, archive names). MO2's own export drops the source; this keeps it.
 - **Restore**: rebuilds a synced profile in an instance: downloads missing mods, runs their installers, then applies the order and enabled state.
 - **GameMode**: puts the game, and only the game, into [Feral GameMode](https://github.com/FeralInteractive/gamemode) when MO2 launches it under Proton. It doesn't use `gamemoderun`, which breaks MO2.
+- **Archive Conflicts** (Cyberpunk 2077): MO2 only sees conflicts between loose files. This scans the `.archive` files in MO2's virtual data folder and shows which game files several archive mods replace, and which archive wins. Results appear as a notification in MO2's problems indicator and under **Tools > mo2linttricks > Archive conflicts**. It uses the rules of rfuzzo's [Archive Conflict Checker](https://www.nexusmods.com/cyberpunk2077/mods/11126).
 - **Cyberpunk 2077 patch**: the upstream Cyberpunk plugin 3.0.1 (it loads CET and RED4ext as forced-load libraries, so Root Builder isn't needed), with a one-line fix so it loads on MO2 2.5.2.
 
 ## Install
@@ -74,10 +75,26 @@ Settings (under **mo2linttricks GameMode**): `extra_targets` (more executable na
 
 `scripts/cp2077-gamemode-watcher` is the older Steam launch-option wrapper, kept as a fallback.
 
+## Archive conflicts
+
+The `.archive` index reader is a Python port of [rfuzzo/red4lib](https://github.com/rfuzzo/red4lib) (MIT). On the 58 archives in a real modlist it produced the same file lists as red4lib itself. Only headers and file tables are read, so a scan takes milliseconds.
+
+Load order follows what the game will actually use:
+
+1. If the Cyberpunk plugin's `enforce_archive_load_order` is on: MO2's mod priority (reversed if `reverse_archive_load_order` is on), because the plugin rewrites `archive/pc/mod/modlist.txt` from it before every launch.
+2. Otherwise: the virtual `archive/pc/mod/modlist.txt`, then the remaining archives by file name.
+3. Otherwise: by file name.
+
+The first archive in load order wins a contested file.
+
+File names come from each archive's own name list (when it isn't Kraken-compressed), and on request from CDPR's resource hash list. That list is 30 MB, downloaded from red4lib at a pinned commit and checked against a SHA-256 hash. Only the hashes you need are looked up, and the results are cached in MO2's plugin data folder. Names that can't be resolved are shown as hashes.
+
+Notifications: "fully overridden archive" (every file loses, so the archive has no effect) always appears. "Any conflicts" can be turned off with `notify_conflicts`.
+
 ## Development
 
 ```bash
-python3 -I tests/test_core.py                      # core logic, no MO2 needed
+python3 -I tests/test_core.py && python3 -I tests/test_archive_conflicts.py   # core logic, no MO2 needed
 (cd helper && go test ./...)
 mypy --python-version 3.12 --ignore-missing-imports --check-untyped-defs plugin/mo2linttricks   # with mobase-stubs 2.5.2 + PyQt6
 ```
