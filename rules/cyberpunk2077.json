@@ -114,6 +114,30 @@
       ],
       "note": "Requirements from its files: .reds (redscript), 'import Codeware' and ModSettings in its scripts (Codeware, Mod Settings), .yaml (TweakXL), .xl (ArchiveXL); no CET scripts. With Immersive Crafting Access, set Dark Future's 'Limit Crafting to Stash' Off.",
       "source": "https://www.nexusmods.com/cyberpunk2077/mods/16300"
+    },
+    "nexus:30726": {
+      "name": "Redscript Configuration Framework",
+      "requires": [
+        "nexus:32312"
+      ],
+      "note": "Imports RedFunctions modules (import RedFunctions.*); without RedFunctions the whole script compile fails.",
+      "source": "scripts' imports; redscript log"
+    },
+    "nexus:32370": {
+      "name": "RedWindows",
+      "requires": [
+        "nexus:32312"
+      ],
+      "note": "Imports RedFunctions modules (import RedFunctions.*); without RedFunctions the whole script compile fails.",
+      "source": "scripts' imports; redscript log"
+    },
+    "nexus:33983": {
+      "name": "RadioXL - Native Radio Stations",
+      "requires": [
+        "nexus:32312"
+      ],
+      "note": "Imports RedFunctions modules (import RedFunctions.*); without RedFunctions the whole script compile fails.",
+      "source": "scripts' imports; redscript log"
     }
   }
 }
