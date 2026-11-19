@@ -5,7 +5,7 @@ Mod Organizer 2 plugins for Linux setups made with [MO2-LINT](https://github.com
 - **Modlist Sync**: mirrors your modlist to a private GitHub repo, `mo2-mods-<game>`, automatically: load order, enabled state, and where every mod came from (Nexus mod and file IDs, URLs, archive names). MO2's own export drops the source; this keeps it.
 - **Restore**: rebuilds a synced profile in an instance: downloads missing mods, runs their installers, then applies the order and enabled state.
 - **GameMode**: puts the game, and only the game, into [Feral GameMode](https://github.com/FeralInteractive/gamemode) when MO2 launches it under Proton. It doesn't use `gamemoderun`, which breaks MO2.
-- **Archive Conflicts** (Cyberpunk 2077): MO2 only sees conflicts between loose files. This scans the `.archive` files in MO2's virtual data folder and shows which game files several archive mods replace, and which archive wins. Results appear as a notification in MO2's problems indicator and under **Tools > mo2linttricks > Archive conflicts**. It uses the rules of rfuzzo's [Archive Conflict Checker](https://www.nexusmods.com/cyberpunk2077/mods/11126).
+- **Conflict resolver** (Cyberpunk 2077): MO2 only sees conflicts between loose files. Cyberpunk mods mostly clash in three other places: `.archive` files replacing the same game resource, TweakXL files setting the same TweakDB value, and redscript mods replacing the same function. The resolver reports all three in MO2's problems indicator and under **Tools > mo2linttricks > Conflict resolver**. For TweakXL it writes an xEdit-style patch mod. For archives it can switch the Cyberpunk plugin to MO2's mod priority.
 - **Cyberpunk 2077 patch**: the upstream Cyberpunk plugin 3.0.1 (it loads CET and RED4ext as forced-load libraries, so Root Builder isn't needed), with a one-line fix so it loads on MO2 2.5.2.
 
 ## Install
@@ -75,7 +75,9 @@ Settings (under **mo2linttricks GameMode**): `extra_targets` (more executable na
 
 `scripts/cp2077-gamemode-watcher` is the older Steam launch-option wrapper, kept as a fallback.
 
-## Archive conflicts
+## Conflict resolver
+
+### Archives
 
 The `.archive` index reader is a Python port of [rfuzzo/red4lib](https://github.com/rfuzzo/red4lib) (MIT). On the 58 archives in a real modlist it produced the same file lists as red4lib itself. Only headers and file tables are read, so a scan takes milliseconds.
 
@@ -91,14 +93,30 @@ File names come from each archive's own name list (when it isn't Kraken-compress
 
 Contested files whose content is byte-for-byte identical in every archive (common when related mods each ship the same shared file) are detected and don't count as conflicts. The index's own SHA-1 field can't be used for this, because WolvenKit writes one constant value for every file, so the stored data is compared instead.
 
+Turning on "Use MO2 mod priority" sets the Cyberpunk plugin's `enforce_archive_load_order` and `reverse_archive_load_order`. From then on, the mod higher in MO2's list wins, the same as for loose files. Before changing anything it previews which contested files would change winner.
+
 Notifications: "fully overridden archive" (every file loses, so the archive has no effect) always appears. "Any conflicts" can be turned off with `notify_conflicts`.
+
+### TweakXL values
+
+TweakXL (see `TweakImporter.cpp`) reads every `r6/tweaks` file. Files whose name starts with `_#$!` are read first and those starting with `^` last. Within each of those groups, files are read in directory order, which isn't defined, and a later value replaces an earlier one. So two mods setting the same property differently often leave the outcome arbitrary.
+
+List operations (`!append`, `!remove`, `+=`, ...) combine and aren't conflicts. Neither are values that are equal everywhere: `1` and `1.0` count as equal.
+
+The patch is the mod **mo2linttricks Patch**; keep it last. It contains `r6/tweaks/mo2linttricks/^mo2linttricks_patch.yaml`, which TweakXL reads after every normal file. For each contested value, the resolver writes the value from the mod highest in MO2's list, unless you pick another mod's value, a custom value, or "leave to TweakXL". Your choices are stored in the patch mod's `mo2linttricks-decisions.json`, so the patch can be regenerated after mods change. A notification appears when the patch is missing, out of date, or not last.
+
+YAML and `.tweak` files are both parsed. Package-relative names follow TweakXL's `RedReader`. Only simple `.tweak` literals can be copied into the patch; complex ones are shown but can't be chosen. PyYAML 6.0.2 (pure Python, MIT) is vendored in `core/_vendor`.
+
+### redscript
+
+The resolver reports functions that several mods replace with `@replaceMethod` or `@replaceGlobal`; only one replacement runs. Byte-identical replacements are marked harmless. `@wrapMethod` combines with other mods, so it isn't listed.
 
 ## Development
 
 ```bash
-python3 -I tests/test_core.py && python3 -I tests/test_archive_conflicts.py   # core logic, no MO2 needed
+for t in tests/test_*.py; do python3 -I $t; done   # core logic, no MO2 needed
 (cd helper && go test ./...)
-mypy --python-version 3.12 --ignore-missing-imports --check-untyped-defs plugin/mo2linttricks   # with mobase-stubs 2.5.2 + PyQt6
+(cd plugin && mypy --config-file ../mypy.ini mo2linttricks)   # with mobase-stubs 2.5.2 + PyQt6
 ```
 
 `plugin/mo2linttricks/core` has no MO2 or Qt imports. MO2 2.5 bundles Python 3.12, so keep the code 3.12-compatible.

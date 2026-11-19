@@ -1,0 +1,760 @@
+"""Cyberpunk 2077 conflict resolver: .archive, TweakXL and redscript conflicts inside MO2.
+
+MO2 only sees loose-file conflicts. Cyberpunk mods mostly clash elsewhere:
+  * .archive files replacing the same game resource (first in load order wins);
+  * TweakXL files setting the same TweakDB value (outcome often depends on directory order);
+  * redscript mods @replaceMethod-ing the same function (only one replacement runs).
+
+This scans MO2's mods, reports through MO2's problems indicator, and offers
+Tools > mo2linttricks > Conflict resolver, which writes an xEdit-style patch mod
+("mo2linttricks Patch", to be placed last) for TweakXL values. Archive order is
+left to MO2's mod priority via the Cyberpunk plugin's own load-order settings.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import threading
+from pathlib import Path
+
+import mobase
+from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal, qInfo, qWarning
+from PyQt6.QtGui import QIcon
+from PyQt6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QHBoxLayout,
+    QHeaderView,
+    QInputDialog,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .core import archive_conflicts as ac
+from .core import redscript as rs
+from .core import tweaks as tw
+from .core.http import Transport
+from .sync_plugin import NAME as SYNC_NAME, VERSION
+
+GAME = "cyberpunk2077"
+CP_PLUGIN = "Cyberpunk 2077 Support Plugin"
+DIAG_NAME = "mo2linttricks Conflicts"
+PATCH_MOD = "mo2linttricks Patch"
+
+PROBLEM_ARCHIVE_OVERRIDDEN = 0
+PROBLEM_ARCHIVE_CONFLICTS = 1
+PROBLEM_TWEAKS_UNRESOLVED = 2
+PROBLEM_PATCH_NOT_LAST = 3
+PROBLEM_SCRIPTS = 4
+
+
+class ConflictModel:
+    """One scan shared by the diagnose plugin and the dialog, redone when mods change."""
+
+    def __init__(self) -> None:
+        self.organizer: mobase.IOrganizer | None = None
+        self.report: ac.ConflictReport | None = None
+        self.order_source = ""
+        self.tweaks: tw.TweakScan = tw.TweakScan()
+        self.scripts: list[rs.ScriptConflict] = []
+        self.mods: list[tuple[str, Path]] = []
+        self.listeners: list = []
+        self._timer = QTimer()
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.rescan)
+
+    def attach(self, organizer: mobase.IOrganizer) -> None:
+        if self.organizer:
+            return
+        self.organizer = organizer
+        ml = organizer.modList()
+        ml.onModStateChanged(lambda _s: self.invalidate())
+        ml.onModMoved(lambda _n, _o, _p: self.invalidate())
+        ml.onModInstalled(lambda _m: self.invalidate())
+        ml.onModRemoved(lambda _n: self.invalidate())
+        organizer.onProfileChanged(lambda _a, _b: self.invalidate())
+        organizer.onFinishedRun(lambda _p, _c: self.invalidate())
+        organizer.onUserInterfaceInitialized(lambda _w: self.invalidate())
+        organizer.onPluginSettingChanged(self._setting_changed)
+
+    def _setting_changed(self, plugin: str, _key: str, _old: object, _new: object) -> None:
+        if plugin == CP_PLUGIN:
+            self.invalidate()
+
+    def applies(self) -> bool:
+        o = self.organizer
+        return bool(o) and o.managedGame().gameShortName().lower() == GAME  # type: ignore[union-attr]
+
+    def invalidate(self) -> None:
+        if self.applies():
+            self._timer.start(1500)
+
+    # --- MO2 state -----------------------------------------------------------------------
+
+    def _active_mods(self) -> list[tuple[str, Path]]:
+        o = self.organizer
+        assert o
+        ml = o.modList()
+        out: list[tuple[str, Path]] = []
+        for name in ml.allModsByProfilePriority():
+            if name == PATCH_MOD or not (ml.state(name) & mobase.ModState.ACTIVE):
+                continue
+            mod = ml.getMod(name)
+            if mod is None or mod.isSeparator() or mod.isForeign():
+                continue
+            out.append((name, Path(mod.absolutePath())))
+        return out
+
+    def archive_settings(self) -> tuple[bool, bool]:
+        o = self.organizer
+        assert o
+        try:
+            return bool(o.pluginSetting(CP_PLUGIN, "enforce_archive_load_order")), bool(
+                o.pluginSetting(CP_PLUGIN, "reverse_archive_load_order")
+            )
+        except Exception:
+            return False, False
+
+    def _modlist(self, mods: list[tuple[str, Path]]) -> tuple[list[str] | None, str]:
+        o = self.organizer
+        assert o
+        enforce, reverse = self.archive_settings()
+        if enforce:
+            how = "higher in MO2 wins" if reverse else "LOWER in MO2 wins (reverse_archive_load_order is off)"
+            return ac.enforced_modlist(mods, reverse), f"MO2 mod priority, {how}"
+        found = o.findFiles("archive/pc/mod", "modlist.txt")
+        if found:
+            try:
+                lines = Path(found[0]).read_text(encoding="utf-8", errors="replace").splitlines()
+                return lines, f"archive/pc/mod/modlist.txt ({len(lines)} entries), then alphabetical"
+            except OSError:
+                pass
+        return None, "alphabetical by file name (no modlist.txt)"
+
+    def _archive_layers(self, mods: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
+        o = self.organizer
+        assert o
+        game = Path(o.managedGame().dataDirectory().absolutePath())
+        return [("<game>", game)] + mods + [("<overwrite>", Path(o.overwritePath()))]
+
+    def rescan(self) -> None:
+        if not self.applies():
+            return
+        try:
+            self.mods = self._active_mods()
+            modlist, self.order_source = self._modlist(self.mods)
+            order = ac.load_order(ac.visible_archives(self._archive_layers(self.mods)), modlist)
+            report = ac.compute(order)
+            report.names.update(load_name_cache(self.organizer))  # type: ignore[arg-type]
+            self.report = report
+            self.tweaks = tw.scan(self.mods)
+            self.scripts = rs.scan(self.mods)
+        except Exception as e:
+            qWarning(f"mo2linttricks conflicts: scan failed: {e}")
+            return
+        for cb in list(self.listeners):
+            cb()
+
+    # --- archive order preview --------------------------------------------------------------
+
+    def preview_mo2_order(self) -> list[tuple[str, str, str]]:
+        """Contested files whose winning archive changes under 'MO2 priority, higher wins'.
+
+        Returns [(file, winner now, winner after)].
+        """
+        if not self.report:
+            return []
+        layers = self._archive_layers(self.mods)
+        after = ac.compute(ac.load_order(ac.visible_archives(layers), ac.enforced_modlist(self.mods, True)))
+        out = []
+        for h, idxs in self.report.conflicts.items():
+            if h in self.report.identical:
+                continue
+            now = self.report.order[idxs[0]].source
+            later = after.order[after.conflicts[h][0]].source if h in after.conflicts else now
+            if now.name != later.name:
+                out.append((self.report.name(h), f"{now.name} ({now.mod})", f"{later.name} ({later.mod})"))
+        return sorted(out)
+
+    # --- patch -------------------------------------------------------------------------------
+
+    def patch_root(self) -> Path | None:
+        o = self.organizer
+        mod = o.modList().getMod(PATCH_MOD) if o else None
+        return Path(mod.absolutePath()) if mod else None
+
+    def patch_state(self) -> tuple[int, bool]:
+        """(number of real TweakXL conflicts not handled by the patch as written, patch is outdated)."""
+        root = self.patch_root()
+        if root is None or not self.organizer or not (self.organizer.modList().state(PATCH_MOD) & mobase.ModState.ACTIVE):
+            return len(self.tweaks.real), False
+        decisions = tw.load_decisions(root)
+        wanted, _ = tw.build_patch(self.tweaks, decisions)
+        current = root / tw.PATCH_DIR / tw.PATCH_FILE
+        have = current.read_text(encoding="utf-8") if current.is_file() else ""
+        patched = tw.patched_keys(root)
+        unhandled = sum(1 for c in self.tweaks.real if c.key not in patched and not decisions.get(c.key, {}).get("skip"))
+        return unhandled, wanted != have
+
+    def patch_not_last(self) -> bool:
+        o = self.organizer
+        if not o or self.patch_root() is None:
+            return False
+        ml = o.modList()
+        order = list(ml.allModsByProfilePriority())
+        if PATCH_MOD not in order:
+            return False
+        for name in order[order.index(PATCH_MOD) + 1 :]:
+            mod = ml.getMod(name)
+            if mod and not mod.isSeparator() and not mod.isForeign():
+                return True
+        return False
+
+    def fully_overridden(self) -> list[ac.ArchiveResult]:
+        rep = self.report
+        if not rep:
+            return []
+        return [r for r in rep.order if r.files and len(r.loses) == r.files and rep.real_counts(r)[1]]
+
+
+MODEL = ConflictModel()
+
+
+# --- vanilla name database (downloaded on request) ---------------------------------------------
+
+
+def _data_dir(organizer: mobase.IOrganizer) -> Path:
+    d = Path(organizer.pluginDataPath()) / "mo2linttricks"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def name_db_path(organizer: mobase.IOrganizer) -> Path:
+    return _data_dir(organizer) / "metadata-resources.zip"
+
+
+def load_name_cache(organizer: mobase.IOrganizer) -> dict[int, str]:
+    try:
+        raw = json.loads((_data_dir(organizer) / "archive-names.json").read_text())
+        return {int(k): v for k, v in raw.items()}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_name_cache(organizer: mobase.IOrganizer, names: dict[int, str]) -> None:
+    cache = load_name_cache(organizer)
+    cache.update(names)
+    (_data_dir(organizer) / "archive-names.json").write_text(json.dumps({str(k): v for k, v in cache.items()}))
+
+
+def download_name_db(dest: Path) -> None:
+    r = Transport(timeout=300)("GET", ac.NAME_DB_URL)
+    if r.status != 200:
+        raise RuntimeError(f"download failed: HTTP {r.status}")
+    digest = hashlib.sha256(r.body).hexdigest()
+    if digest != ac.NAME_DB_SHA256:
+        raise RuntimeError(f"checksum mismatch ({digest[:12]}...), not saved")
+    tmp = dest.with_suffix(".part")
+    tmp.write_bytes(r.body)
+    tmp.replace(dest)
+
+
+# --- diagnose ------------------------------------------------------------------------------------
+
+
+class ConflictsDiagnose(mobase.IPluginDiagnose):
+    def __init__(self) -> None:
+        super().__init__()
+        self._organizer: mobase.IOrganizer | None = None
+
+    def init(self, organizer: mobase.IOrganizer) -> bool:
+        self._organizer = organizer
+        MODEL.attach(organizer)
+        MODEL.listeners.append(self._invalidate)
+        return True
+
+    def name(self) -> str:
+        return DIAG_NAME
+
+    def localizedName(self) -> str:
+        return "mo2linttricks: Conflicts"
+
+    def author(self) -> str:
+        return "LinkIsGrim"
+
+    def description(self) -> str:
+        return "Reports Cyberpunk 2077 .archive, TweakXL and redscript conflicts between mods."
+
+    def version(self) -> mobase.VersionInfo:
+        return VERSION
+
+    def master(self) -> str:
+        return SYNC_NAME
+
+    def settings(self) -> list[mobase.PluginSetting]:
+        return [
+            mobase.PluginSetting("notify_archive_conflicts", "Notify about any .archive conflicts, not only fully overridden archives", True),
+        ]
+
+    def _enabled(self) -> bool:
+        return bool(self._organizer and self._organizer.isPluginEnabled(self) and MODEL.applies())
+
+    def activeProblems(self) -> list[int]:
+        if not self._enabled() or not MODEL.report:
+            return []
+        problems = []
+        if MODEL.fully_overridden():
+            problems.append(PROBLEM_ARCHIVE_OVERRIDDEN)
+        notify = self._organizer.pluginSetting(DIAG_NAME, "notify_archive_conflicts") if self._organizer else True
+        if MODEL.report.real_conflicts and (notify is None or notify):
+            problems.append(PROBLEM_ARCHIVE_CONFLICTS)
+        unhandled, outdated = MODEL.patch_state()
+        if unhandled or outdated:
+            problems.append(PROBLEM_TWEAKS_UNRESOLVED)
+        if MODEL.patch_not_last():
+            problems.append(PROBLEM_PATCH_NOT_LAST)
+        if any(not c.identical for c in MODEL.scripts):
+            problems.append(PROBLEM_SCRIPTS)
+        return problems
+
+    def shortDescription(self, key: int) -> str:
+        rep = MODEL.report
+        if key == PROBLEM_ARCHIVE_OVERRIDDEN:
+            return f"{len(MODEL.fully_overridden())} .archive file(s) are completely overridden by other mods"
+        if key == PROBLEM_ARCHIVE_CONFLICTS:
+            n = len(rep.real_conflicts) if rep else 0
+            a = len(rep.really_conflicting_archives) if rep else 0
+            return f"{n} game file(s) are replaced differently by more than one .archive ({a} archives involved)"
+        if key == PROBLEM_TWEAKS_UNRESOLVED:
+            unhandled, outdated = MODEL.patch_state()
+            if unhandled:
+                return f"{unhandled} TweakXL value(s) are set differently by several mods and not resolved by a patch"
+            return "The mo2linttricks Patch is out of date"
+        if key == PROBLEM_PATCH_NOT_LAST:
+            return f"\"{PATCH_MOD}\" should be the last mod in the list"
+        n = sum(1 for c in MODEL.scripts if not c.identical)
+        return f"{n} redscript function(s) are replaced by more than one mod"
+
+    def fullDescription(self, key: int) -> str:
+        rep = MODEL.report
+        tool = "<p>Details and fixes: Tools &gt; mo2linttricks &gt; Conflict resolver.</p>"
+        if not rep:
+            return ""
+        if key == PROBLEM_ARCHIVE_OVERRIDDEN:
+            rows = "".join(f"<li><b>{r.source.name}</b> ({r.source.mod}): all {r.files} files lose</li>" for r in MODEL.fully_overridden())
+            return (
+                "<p>Every file in these archives is also in an archive that loads earlier, so they have no effect.</p>"
+                f"<ul>{rows}</ul><p>Load order: {MODEL.order_source}.</p>" + tool
+            )
+        if key == PROBLEM_ARCHIVE_CONFLICTS:
+            arch = rep.really_conflicting_archives
+            top = sorted(arch, key=lambda r: -sum(rep.real_counts(r)))[:15]
+            rows = "".join(
+                f"<li><b>{r.source.name}</b> ({r.source.mod}): wins {rep.real_counts(r)[0]}, loses {rep.real_counts(r)[1]}</li>" for r in top
+            )
+            more = f"<p>...and {len(arch) - len(top)} more.</p>" if len(arch) > len(top) else ""
+            same = f" {len(rep.identical)} more contested file(s) are identical everywhere and not counted." if rep.identical else ""
+            return (
+                "<p>Several .archive mods contain different versions of the same game files; the first one in load order "
+                f"wins.{same}</p><ul>{rows}</ul>{more}<p>Load order: {MODEL.order_source}.</p>" + tool
+                + "<p>Turn this notice off with the plugin setting notify_archive_conflicts.</p>"
+            )
+        if key == PROBLEM_TWEAKS_UNRESOLVED:
+            items = "".join(
+                f"<li><b>{c.key}</b>: " + ", ".join(f"{v.mod} = {v.display[:40]}" for v in c.values) + "</li>"
+                for c in MODEL.tweaks.real[:15]
+            )
+            return (
+                "<p>TweakXL applies these files in directory order, so which mod's value the game uses is often arbitrary. "
+                f"Write a patch to pick one explicitly (default: the mod highest in MO2's list).</p><ul>{items}</ul>" + tool
+            )
+        if key == PROBLEM_PATCH_NOT_LAST:
+            return f"<p>Drag <b>{PATCH_MOD}</b> to the bottom of the mod list so nothing overrides it.</p>"
+        items = "".join(
+            f"<li><b>{c.target}</b>: " + ", ".join(sorted({r.mod for r in c.replacements})) + "</li>" for c in MODEL.scripts if not c.identical
+        )
+        return (
+            "<p>These mods each replace the same game function; only one replacement runs, so the other mods' "
+            f"changes to it are lost. They usually need a compatibility patch from the authors.</p><ul>{items}</ul>" + tool
+        )
+
+    def hasGuidedFix(self, key: int) -> bool:
+        return False
+
+    def startGuidedFix(self, key: int) -> None:
+        pass
+
+
+# --- dialog ---------------------------------------------------------------------------------------
+
+
+class _Done(QObject):
+    done = pyqtSignal(str)
+
+
+class TweakTab(QWidget):
+    LEAVE = "(leave to TweakXL: unpatched)"
+    CUSTOM = "custom value..."
+
+    def __init__(self, organizer: mobase.IOrganizer, parent: QWidget):
+        super().__init__(parent)
+        self._o = organizer
+        lay = QVBoxLayout(self)
+        self._info = QLabel()
+        self._info.setWordWrap(True)
+        lay.addWidget(self._info)
+        self._same = QCheckBox("Show values that are identical in every mod")
+        self._same.toggled.connect(self.refresh_view)
+        lay.addWidget(self._same)
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(["TweakDB value", "Set by (lowest MO2 priority first)", "Game uses today", "Patch writes"])
+        header = self._table.horizontalHeader()
+        if header:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        lay.addWidget(self._table, 1)
+        row = QHBoxLayout()
+        write = QPushButton("Write patch")
+        write.clicked.connect(self._write)
+        row.addStretch(1)
+        row.addWidget(write)
+        lay.addLayout(row)
+        root = MODEL.patch_root()
+        self._decisions: dict[str, dict] = tw.load_decisions(root) if root else {}
+        self.refresh_view()
+
+    def refresh_view(self) -> None:
+        show = MODEL.tweaks.conflicts if self._same.isChecked() else MODEL.tweaks.real
+        unhandled, outdated = MODEL.patch_state()
+        root = MODEL.patch_root()
+        self._info.setText(
+            f"<b>{len(MODEL.tweaks.real)}</b> TweakDB values are set differently by several mods "
+            f"({len(MODEL.tweaks.conflicts) - len(MODEL.tweaks.real)} more set identically). "
+            "TweakXL reads files in directory order, so without a patch the result is often arbitrary. "
+            f"The patch (<i>{PATCH_MOD}</i>, keep it last) sets each value explicitly; by default to the "
+            "value of the mod highest in MO2's list."
+            + (f"<br>Patch: {'not created yet' if root is None else ('out of date' if outdated else 'up to date')}"
+               + (f", {unhandled} value(s) not covered" if unhandled else "") + ".")
+            + (f"<br><span style='color:#c33'>{len(MODEL.tweaks.errors)} tweak file(s) could not be parsed.</span>" if MODEL.tweaks.errors else "")
+        )
+        self._table.setRowCount(len(show))
+        for i, c in enumerate(show):
+            self._table.setItem(i, 0, QTableWidgetItem(c.key))
+            vals = QTableWidgetItem(" | ".join(f"{v.mod}: {v.display[:60]}" for v in c.values))
+            vals.setToolTip("\n".join(f"{v.mod} ({v.file}): {v.display}" for v in c.values))
+            self._table.setItem(i, 1, vals)
+            w = c.runtime_winner()
+            self._table.setItem(i, 2, QTableWidgetItem(w.mod if w else "undefined (directory order)"))
+            for col in range(3):
+                item = self._table.item(i, col)
+                if item:
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            if c.identical:
+                self._table.setItem(i, 3, QTableWidgetItem("(identical, nothing to do)"))
+                continue
+            box = QComboBox()
+            default = c.default_choice()
+            box.addItem(f"MO2 priority: {default.mod}" if default else "MO2 priority: (no patchable value)", None)
+            for v in reversed(c.values):
+                if v.patchable:
+                    box.addItem(f"{v.mod}: {v.display[:50]}", {"mod": v.mod})
+            box.addItem(self.LEAVE, {"skip": True})
+            box.addItem(self.CUSTOM, "custom")
+            d = self._decisions.get(c.key)
+            if d and "custom" in d:
+                box.insertItem(box.count() - 1, f"custom: {d['custom']}", d)
+            for idx in range(box.count()):
+                if box.itemData(idx) == d:
+                    box.setCurrentIndex(idx)
+            box.currentIndexChanged.connect(lambda _i, b=box, k=c.key: self._choose(k, b))
+            self._table.setCellWidget(i, 3, box)
+
+    def _choose(self, key: str, box: QComboBox) -> None:
+        data = box.currentData()
+        if data == "custom":
+            text, ok = QInputDialog.getText(self, "Custom value", f"YAML value for {key}:")
+            if not ok or not text.strip():
+                box.setCurrentIndex(0)
+                return
+            try:
+                tw.yaml.safe_load(text)
+            except Exception as e:
+                QMessageBox.warning(self, "mo2linttricks", f"Not valid YAML: {e}")
+                box.setCurrentIndex(0)
+                return
+            self._decisions[key] = {"custom": text.strip()}
+            self.refresh_view()
+            return
+        if data is None:
+            self._decisions.pop(key, None)
+        else:
+            self._decisions[key] = data
+
+    def _write(self) -> None:
+        o = self._o
+        root = MODEL.patch_root()
+        if root is None:
+            mod = o.createMod(mobase.GuessedString(PATCH_MOD))
+            if mod is None:
+                QMessageBox.warning(self, "mo2linttricks", f"Could not create the mod \"{PATCH_MOD}\".")
+                return
+            root = Path(mod.absolutePath())
+        n = tw.write_patch(root, MODEL.tweaks, self._decisions)
+        o.modList().setActive(PATCH_MOD, True)
+        o.refresh(True)
+        MODEL.rescan()
+        self.refresh_view()
+        msg = f"Wrote {n} value(s) to {PATCH_MOD}."
+        if MODEL.patch_not_last():
+            msg += f"<br><br>Now drag <b>{PATCH_MOD}</b> to the bottom of the mod list."
+        QMessageBox.information(self, "mo2linttricks", msg)
+
+
+class ArchiveTab(QWidget):
+    def __init__(self, organizer: mobase.IOrganizer, parent: QWidget):
+        super().__init__(parent)
+        self._o = organizer
+        lay = QVBoxLayout(self)
+        self._info = QLabel()
+        self._info.setWordWrap(True)
+        lay.addWidget(self._info)
+        opts = QHBoxLayout()
+        self._all = QCheckBox("Show archives without conflicts")
+        self._all.toggled.connect(self.refresh_view)
+        self._same = QCheckBox("Show identical files")
+        self._same.toggled.connect(self.refresh_view)
+        opts.addWidget(self._all)
+        opts.addWidget(self._same)
+        opts.addStretch(1)
+        lay.addLayout(opts)
+        self._tree = QTreeWidget()
+        self._tree.setHeaderLabels(["#", "Archive / file", "Mod", "Wins", "Loses", "Identical"])
+        header = self._tree.header()
+        if header:
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        lay.addWidget(self._tree, 1)
+        row = QHBoxLayout()
+        self._order = QPushButton("Use MO2 mod priority for archive order...")
+        self._order.clicked.connect(self._use_mo2_order)
+        self._names = QPushButton()
+        self._names.clicked.connect(self._resolve_names)
+        row.addWidget(self._order)
+        row.addWidget(self._names)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self._sig = _Done()
+        self._sig.done.connect(self._names_done)
+        self.refresh_view()
+
+    def refresh_view(self) -> None:
+        rep = MODEL.report
+        self._tree.clear()
+        enforce, reverse = MODEL.archive_settings()
+        self._order.setVisible(not (enforce and reverse))
+        has_db = name_db_path(self._o).exists()
+        self._names.setText("Resolve file names" if has_db else f"Resolve file names (downloads {ac.NAME_DB_SIZE_MB} MB once)")
+        if not rep:
+            self._info.setText("No scan yet.")
+            return
+        errors = [r for r in rep.order if r.error]
+        self._info.setText(
+            f"<b>{len(rep.order)}</b> archives, <b>{len(rep.really_conflicting_archives)}</b> with real conflicts, "
+            f"<b>{len(rep.real_conflicts)}</b> files that differ (+{len(rep.identical)} identical duplicates). "
+            f"Load order: {MODEL.order_source}. First in load order wins."
+            + (f"<br><span style='color:#c33'>{len(errors)} archive(s) could not be read.</span>" if errors else "")
+        )
+        show_same = self._same.isChecked()
+        grey = Qt.GlobalColor.gray
+        for i, r in enumerate(rep.order):
+            wins, loses = rep.real_counts(r)
+            same = len(r.wins) + len(r.loses) - wins - loses
+            if not (wins or loses or r.error or self._all.isChecked() or (show_same and same)):
+                continue
+            top = QTreeWidgetItem([str(i), r.source.name, r.source.mod, str(wins), str(loses), str(same)])
+            if r.error:
+                top.setText(1, f"{r.source.name}  [unreadable: {r.error}]")
+            if not (wins or loses):
+                for c in range(6):
+                    top.setForeground(c, grey)
+            for h in r.wins + r.loses:
+                if h in rep.identical and not show_same:
+                    continue
+                if h in r.wins:
+                    others = ", ".join(f"{rep.order[j].source.name} ({rep.order[j].source.mod})" for j in rep.conflicts[h][1:])
+                    child = QTreeWidgetItem(["", f"wins  {rep.name(h)}", f"over {others}", "", "", "same" if h in rep.identical else ""])
+                else:
+                    w = rep.order[rep.conflicts[h][0]].source
+                    child = QTreeWidgetItem(["", f"loses {rep.name(h)}", f"to {w.name} ({w.mod})", "", "", "same" if h in rep.identical else ""])
+                if h in rep.identical:
+                    child.setForeground(1, grey)
+                top.addChild(child)
+            self._tree.addTopLevelItem(top)
+
+    def _use_mo2_order(self) -> None:
+        changes = MODEL.preview_mo2_order()
+        rows = "".join(f"<li>{f}<br>&nbsp;&nbsp;now: {a}<br>&nbsp;&nbsp;then: {b}</li>" for f, a, b in changes[:25])
+        more = f"<p>...and {len(changes) - 25} more.</p>" if len(changes) > 25 else ""
+        text = (
+            "<p>Turns on the Cyberpunk plugin's <i>enforce_archive_load_order</i> and <i>reverse_archive_load_order</i>: "
+            "before each launch it writes archive/pc/mod/modlist.txt from MO2's mod priority, so the mod "
+            "<b>higher in MO2's list wins</b>, same as for loose files.</p>"
+            + (f"<p>With your current mod order these contested files would change winner:</p><ul>{rows}</ul>{more}"
+               "<p>Reorder mods in MO2 afterwards where you want a different winner.</p>" if changes else
+               "<p>With your current mod order no contested file changes winner.</p>")
+        )
+        box = QMessageBox(QMessageBox.Icon.Question, "Use MO2 mod priority for archives?", text,
+                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self)
+        box.setTextFormat(Qt.TextFormat.RichText)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return
+        self._o.setPluginSetting(CP_PLUGIN, "enforce_archive_load_order", True)
+        self._o.setPluginSetting(CP_PLUGIN, "reverse_archive_load_order", True)
+        MODEL.rescan()
+        self.refresh_view()
+
+    def _resolve_names(self) -> None:
+        rep = MODEL.report
+        if not rep:
+            return
+        wanted = {h for h in rep.conflicts if h not in rep.names}
+        if not wanted:
+            QMessageBox.information(self, "mo2linttricks", "All contested files already have names.")
+            return
+        db = name_db_path(self._o)
+        if not db.exists():
+            r = QMessageBox.question(
+                self, "mo2linttricks",
+                f"Download CDPR's resource name list ({ac.NAME_DB_SIZE_MB} MB, from rfuzzo/red4lib, checksum-verified) to {db.parent}?",
+            )
+            if r != QMessageBox.StandardButton.Yes:
+                return
+        self._names.setEnabled(False)
+        self._names.setText("Resolving...")
+
+        def run() -> None:
+            try:
+                if not db.exists():
+                    download_name_db(db)
+                found = ac.resolve_names(db, wanted)
+                save_name_cache(self._o, found)
+                self._sig.done.emit(f"Resolved {len(found)} of {len(wanted)} file names.")
+            except Exception as e:
+                self._sig.done.emit(f"Failed: {e}")
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _names_done(self, message: str) -> None:
+        self._names.setEnabled(True)
+        qInfo(f"mo2linttricks conflicts: {message}")
+        if MODEL.report:
+            MODEL.report.names.update(load_name_cache(self._o))
+        self.refresh_view()
+        QMessageBox.information(self, "mo2linttricks", message + " Files still shown as hashes were added by mods whose archives don't store names.")
+
+
+class ScriptTab(QWidget):
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        info = QLabel(
+            "Functions that several mods replace with <code>@replaceMethod</code>/<code>@replaceGlobal</code>. Only one "
+            "replacement runs. Identical replacements are harmless; others usually need a compatibility patch from the "
+            "mod authors (or hide one mod's script in MO2's Data tab). <code>@wrapMethod</code> combines and is not listed."
+        )
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["Function", "Status"])
+        header = tree.header()
+        if header:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for c in MODEL.scripts:
+            top = QTreeWidgetItem([c.target, "identical, harmless" if c.identical else "DIFFERENT, only one runs"])
+            if c.identical:
+                top.setForeground(0, Qt.GlobalColor.gray)
+            for r in c.replacements:
+                top.addChild(QTreeWidgetItem([f"{r.mod}: {r.file}", ""]))
+            tree.addTopLevelItem(top)
+        if not MODEL.scripts:
+            tree.addTopLevelItem(QTreeWidgetItem(["No function is replaced by more than one mod.", ""]))
+        lay.addWidget(tree, 1)
+
+
+class ResolverDialog(QDialog):
+    def __init__(self, organizer: mobase.IOrganizer, parent: QWidget | None):
+        super().__init__(parent)
+        self.setWindowTitle("Conflict resolver (Cyberpunk 2077)")
+        self.resize(1150, 700)
+        MODEL.rescan()
+        lay = QVBoxLayout(self)
+        tabs = QTabWidget()
+        real_scripts = sum(1 for c in MODEL.scripts if not c.identical)
+        rep = MODEL.report
+        tabs.addTab(TweakTab(organizer, self), f"TweakXL values ({len(MODEL.tweaks.real)})")
+        tabs.addTab(ArchiveTab(organizer, self), f"Archives ({len(rep.real_conflicts) if rep else 0})")
+        tabs.addTab(ScriptTab(self), f"redscript ({real_scripts})")
+        lay.addWidget(tabs, 1)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(close)
+        lay.addLayout(row)
+
+
+class ConflictResolverTool(mobase.IPluginTool):
+    def __init__(self) -> None:
+        super().__init__()
+        self._organizer: mobase.IOrganizer | None = None
+        self._parent: QWidget | None = None
+
+    def init(self, organizer: mobase.IOrganizer) -> bool:
+        self._organizer = organizer
+        MODEL.attach(organizer)
+        return True
+
+    def name(self) -> str:
+        return "mo2linttricks Conflict Resolver"
+
+    def displayName(self) -> str:
+        return "mo2linttricks/Conflict resolver (Cyberpunk 2077)"
+
+    def tooltip(self) -> str:
+        return ".archive, TweakXL and redscript conflicts between mods, with a TweakXL patch generator"
+
+    def description(self) -> str:
+        return self.tooltip()
+
+    def author(self) -> str:
+        return "LinkIsGrim"
+
+    def version(self) -> mobase.VersionInfo:
+        return VERSION
+
+    def master(self) -> str:
+        return SYNC_NAME
+
+    def settings(self) -> list[mobase.PluginSetting]:
+        return []
+
+    def icon(self) -> QIcon:
+        return QIcon()
+
+    def setParentWidget(self, parent: QWidget) -> None:
+        self._parent = parent
+
+    def display(self) -> None:
+        if not self._organizer or not MODEL.applies():
+            QMessageBox.information(self._parent, "mo2linttricks", "The conflict resolver is for Cyberpunk 2077 instances.")
+            return
+        ResolverDialog(self._organizer, self._parent).exec()
