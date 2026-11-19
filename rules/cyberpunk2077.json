@@ -106,14 +106,13 @@
         }
       ],
       "requires": [
-        "nexus:107",
         "nexus:1511",
         "nexus:7780",
+        "nexus:4885",
         "nexus:4197",
-        "nexus:4198",
-        "nexus:4885"
+        "nexus:4198"
       ],
-      "note": "Requirements inferred from its files (.lua CET, .reds redscript + Codeware, .yaml TweakXL, .xl ArchiveXL) and its settings living in Mod Settings. With Immersive Crafting Access set Dark Future's 'Limit Crafting to Stash' Off.",
+      "note": "Requirements from its files: .reds (redscript), 'import Codeware' and ModSettings in its scripts (Codeware, Mod Settings), .yaml (TweakXL), .xl (ArchiveXL); no CET scripts. With Immersive Crafting Access, set Dark Future's 'Limit Crafting to Stash' Off.",
       "source": "https://www.nexusmods.com/cyberpunk2077/mods/16300"
     }
   }
