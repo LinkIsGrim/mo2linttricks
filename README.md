@@ -122,7 +122,8 @@ YAML and `.tweak` files are both parsed. Package-relative names follow TweakXL's
 MO2's plugin API can't add mod-list columns, so the plugin wraps the Qt delegate that draws the **Conflicts** column. MO2's own icons stay on the left; the plugin adds badges on the right:
 
 - **A** archives, **T** TweakXL values, **S** redscript, **R** load-order rules.
-- **Red** means it needs attention: an unresolved TweakXL value, a fully overridden archive, a differing redscript replacement, or a broken rule. **Amber** means resolved or expected.
+- **Red** means it needs attention: an unresolved TweakXL value, a fully overridden archive, a differing redscript replacement, or a broken rule. **Amber** means an archive conflict that no load-order rule covers yet.
+- **Known conflicts get no badge and no notification.** That covers archive conflicts where a load-order rule (community or your own) puts the winner below every loser, TweakXL values resolved by the patch, overlaps between archives of one mod, and identical files. **Accept current winners as known…** in the Archives tab saves the remaining outcomes as your own rules.
 
 Hovering adds the details to MO2's tooltip. Turn it off with `show_in_mod_list`.
 

@@ -103,6 +103,7 @@ class ConflictModel:
         self._fetched.done.connect(self._rules_fetched)
         self.listeners: list = []
         self.mod_issues: dict[str, list[Issue]] = {}
+        self.known: set[int] = set()  # contested archive files whose outcome a rule accounts for
         self.badges = ModListBadges(lambda name: self.mod_issues.get(name, []))
         self._timer = QTimer()
         self._timer.setSingleShot(True)
@@ -316,6 +317,7 @@ class ConflictModel:
         for key in ("rules", "rules_report", "report", "tweaks", "scripts"):
             if key in out:
                 setattr(self, key, out[key])
+        self.known = self._known_archive_conflicts()
         try:
             self.mod_issues = self._build_issues()
         except Exception as e:
@@ -323,6 +325,50 @@ class ConflictModel:
         self.badges.refresh()
         for cb in list(self.listeners):
             cb()
+
+    def _known_archive_conflicts(self) -> set[int]:
+        """Contested files that need no attention: all archives from one mod, or every losing
+        mod is ordered before the winner by a load-order rule (community or user) that holds."""
+        rep = self.report
+        if not rep:
+            return set()
+        pairs = {(e.before, e.after) for e in self.rules_report.edges}
+        known = set()
+        for h, idxs in rep.real_conflicts.items():
+            winner = rep.order[idxs[0]].source.mod
+            losers = {rep.order[j].source.mod for j in idxs[1:]} - {winner}
+            if all((loser, winner) in pairs for loser in losers):
+                known.add(h)
+        return known
+
+    def unknown_conflicts(self) -> dict[int, list[int]]:
+        rep = self.report
+        return {h: i for h, i in rep.real_conflicts.items() if h not in self.known} if rep else {}
+
+    def unknown_counts(self, r: ac.ArchiveResult) -> tuple[int, int]:
+        rep = self.report
+        if not rep:
+            return 0, 0
+        bad = lambda h: h not in rep.identical and h not in self.known  # noqa: E731
+        return sum(1 for h in r.wins if bad(h)), sum(1 for h in r.loses if bad(h))
+
+    def accept_current_archive_winners(self) -> int:
+        """Save every unknown archive conflict's current outcome as user rules. Returns rules added."""
+        rep = self.report
+        if not rep:
+            return 0
+        local = {m.name: m for m in self.local}
+        added = set()
+        for h, idxs in self.unknown_conflicts().items():
+            winner = rep.order[idxs[0]].source.mod
+            for j in idxs[1:]:
+                loser = rep.order[j].source.mod
+                if loser == winner or (loser, winner) in added or winner not in local or loser not in local:
+                    continue
+                w, lo = local[winner], local[loser]
+                R.save_user_rule(self.user_rules_path(), R.key_for(w, self.rules), "load_after", R.key_for(lo, self.rules), winner)
+                added.add((loser, winner))
+        return len(added)
 
     def _build_issues(self) -> dict[str, list[Issue]]:
         """Per-mod summary for the mod-list badges and their tooltips."""
@@ -335,11 +381,11 @@ class ConflictModel:
         if rep:
             overridden = {id(r) for r in self.fully_overridden()}
             for r in rep.order:
-                wins, loses = rep.real_counts(r)
-                if not (wins or loses):
+                wins, loses = self.unknown_counts(r)
+                if not (wins or loses) and id(r) not in overridden:
                     continue
                 rivals = sorted(
-                    {rep.order[j].source.mod for h in r.wins + r.loses if h not in rep.identical for j in rep.conflicts[h]}
+                    {rep.order[j].source.mod for h in r.wins + r.loses if h in self.unknown_conflicts() for j in rep.conflicts[h]}
                     - {r.source.mod}
                 )
                 text = f"{r.source.name}: wins {wins}, loses {loses} (vs {', '.join(rivals[:4])}{'...' if len(rivals) > 4 else ''})"
@@ -359,8 +405,8 @@ class ConflictModel:
                     unresolved[v.mod] = unresolved.get(v.mod, 0) + 1
         for mod, keys in per_mod.items():
             n_open = unresolved.get(mod, 0)
-            status = f"{n_open} not resolved by the patch" if n_open else "all resolved by mo2linttricks Patch"
-            add(mod, Issue("T", bool(n_open), f"{len(keys)} TweakDB value(s) also set by other mods ({status}), e.g. {keys[0]}"))
+            if n_open:  # values resolved by the patch are known; no badge
+                add(mod, Issue("T", True, f"{n_open} TweakDB value(s) set differently by other mods and not resolved by the patch, e.g. {keys[0]}"))
         for sc in self.scripts:
             if sc.identical:
                 continue
@@ -570,7 +616,7 @@ class ConflictsDiagnose(mobase.IPluginDiagnose):
         if MODEL.fully_overridden():
             problems.append(PROBLEM_ARCHIVE_OVERRIDDEN)
         notify = self._organizer.pluginSetting(DIAG_NAME, "notify_archive_conflicts") if self._organizer else True
-        if MODEL.report.real_conflicts and (notify is None or notify):
+        if MODEL.unknown_conflicts() and (notify is None or notify):
             problems.append(PROBLEM_ARCHIVE_CONFLICTS)
         unhandled, outdated = MODEL.patch_state()
         if unhandled or outdated:
@@ -593,9 +639,9 @@ class ConflictsDiagnose(mobase.IPluginDiagnose):
         if key == PROBLEM_ARCHIVE_OVERRIDDEN:
             return f"{len(MODEL.fully_overridden())} .archive file(s) are completely overridden by other mods"
         if key == PROBLEM_ARCHIVE_CONFLICTS:
-            n = len(rep.real_conflicts) if rep else 0
-            a = len(rep.really_conflicting_archives) if rep else 0
-            return f"{n} game file(s) are replaced differently by more than one .archive ({a} archives involved)"
+            n = len(MODEL.unknown_conflicts())
+            a = sum(1 for r in rep.order if any(MODEL.unknown_counts(r))) if rep else 0
+            return f"{n} .archive conflict(s) not covered by a load-order rule ({a} archives involved)"
         if key == PROBLEM_TWEAKS_UNRESOLVED:
             unhandled, outdated = MODEL.patch_state()
             if unhandled:
@@ -625,13 +671,16 @@ class ConflictsDiagnose(mobase.IPluginDiagnose):
                 f"<ul>{rows}</ul><p>Load order: {MODEL.order_source}.</p>" + tool
             )
         if key == PROBLEM_ARCHIVE_CONFLICTS:
-            arch = rep.really_conflicting_archives
-            top = sorted(arch, key=lambda r: -sum(rep.real_counts(r)))[:15]
+            arch = [r for r in rep.order if any(MODEL.unknown_counts(r))]
+            top = sorted(arch, key=lambda r: -sum(MODEL.unknown_counts(r)))[:15]
             rows = "".join(
-                f"<li><b>{r.source.name}</b> ({r.source.mod}): wins {rep.real_counts(r)[0]}, loses {rep.real_counts(r)[1]}</li>" for r in top
+                f"<li><b>{r.source.name}</b> ({r.source.mod}): wins {MODEL.unknown_counts(r)[0]}, loses {MODEL.unknown_counts(r)[1]}</li>" for r in top
             )
             more = f"<p>...and {len(arch) - len(top)} more.</p>" if len(arch) > len(top) else ""
-            same = f" {len(rep.identical)} more contested file(s) are identical everywhere and not counted." if rep.identical else ""
+            same = (
+                f" Not counted: {len(MODEL.known)} conflict(s) whose outcome a load-order rule covers, "
+                f"{len(rep.identical)} identical duplicate(s). Accept the rest as known in the Conflict resolver's Archives tab."
+            )
             return (
                 "<p>Several .archive mods contain different versions of the same game files; the first one in load order "
                 f"wins.{same}</p><ul>{rows}</ul>{more}<p>Load order: {MODEL.order_source}.</p>" + tool
@@ -818,7 +867,10 @@ class ArchiveTab(QWidget):
         self._all.toggled.connect(self.refresh_view)
         self._same = QCheckBox("Show identical files")
         self._same.toggled.connect(self.refresh_view)
+        self._known = QCheckBox("Show known conflicts (covered by a load-order rule)")
+        self._known.toggled.connect(self.refresh_view)
         opts.addWidget(self._all)
+        opts.addWidget(self._known)
         opts.addWidget(self._same)
         opts.addStretch(1)
         lay.addLayout(opts)
@@ -831,9 +883,12 @@ class ArchiveTab(QWidget):
         row = QHBoxLayout()
         self._order = QPushButton("Use MO2 mod priority for archive order...")
         self._order.clicked.connect(self._use_mo2_order)
+        self._accept = QPushButton("Accept current winners as known...")
+        self._accept.clicked.connect(self._accept_known)
         self._names = QPushButton()
         self._names.clicked.connect(self._resolve_names)
         row.addWidget(self._order)
+        row.addWidget(self._accept)
         row.addWidget(self._names)
         row.addStretch(1)
         lay.addLayout(row)
@@ -853,16 +908,18 @@ class ArchiveTab(QWidget):
             return
         errors = [r for r in rep.order if r.error]
         self._info.setText(
-            f"<b>{len(rep.order)}</b> archives, <b>{len(rep.really_conflicting_archives)}</b> with real conflicts, "
-            f"<b>{len(rep.real_conflicts)}</b> files that differ (+{len(rep.identical)} identical duplicates). "
+            f"<b>{len(rep.order)}</b> archives; <b>{len(MODEL.unknown_conflicts())}</b> contested file(s) not covered by a rule, "
+            f"{len(MODEL.known)} known (a load-order rule decides them), {len(rep.identical)} identical duplicates. "
             f"Load order: {MODEL.order_source}. First in load order wins."
             + (f"<br><span style='color:#c33'>{len(errors)} archive(s) could not be read.</span>" if errors else "")
         )
         show_same = self._same.isChecked()
+        show_known = self._known.isChecked()
         grey = Qt.GlobalColor.gray
+        self._accept.setEnabled(bool(MODEL.unknown_conflicts()))
         for i, r in enumerate(rep.order):
-            wins, loses = rep.real_counts(r)
-            same = len(r.wins) + len(r.loses) - wins - loses
+            wins, loses = MODEL.unknown_counts(r) if not show_known else rep.real_counts(r)
+            same = len(r.wins) + len(r.loses) - sum(rep.real_counts(r))
             if not (wins or loses or r.error or self._all.isChecked() or (show_same and same)):
                 continue
             top = QTreeWidgetItem([str(i), r.source.name, r.source.mod, str(wins), str(loses), str(same)])
@@ -874,6 +931,8 @@ class ArchiveTab(QWidget):
             for h in r.wins + r.loses:
                 if h in rep.identical and not show_same:
                     continue
+                if h in MODEL.known and not show_known:
+                    continue
                 if h in r.wins:
                     others = ", ".join(f"{rep.order[j].source.name} ({rep.order[j].source.mod})" for j in rep.conflicts[h][1:])
                     child = QTreeWidgetItem(["", f"wins  {rep.name(h)}", f"over {others}", "", "", "same" if h in rep.identical else ""])
@@ -884,6 +943,20 @@ class ArchiveTab(QWidget):
                     child.setForeground(1, grey)
                 top.addChild(child)
             self._tree.addTopLevelItem(top)
+
+    def _accept_known(self) -> None:
+        n = len(MODEL.unknown_conflicts())
+        r = QMessageBox.question(
+            self, "mo2linttricks",
+            f"Save the current outcome of {n} contested file(s) as your own load-order rules "
+            "(winner stays below loser)? They stop being flagged, and Sort will keep them.",
+        )
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        added = MODEL.accept_current_archive_winners()
+        MODEL.rescan()
+        self.refresh_view()
+        QMessageBox.information(self, "mo2linttricks", f"Added {added} rule(s) to {MODEL.user_rules_path().name}.")
 
     def _use_mo2_order(self) -> None:
         changes = MODEL.preview_mo2_order()
@@ -1121,7 +1194,7 @@ class ResolverDialog(QDialog):
         real_scripts = sum(1 for c in MODEL.scripts if not c.identical)
         rep = MODEL.report
         tabs.addTab(TweakTab(organizer, self), f"TweakXL values ({len(MODEL.tweaks.real)})")
-        tabs.addTab(ArchiveTab(organizer, self), f"Archives ({len(rep.real_conflicts) if rep else 0})")
+        tabs.addTab(ArchiveTab(organizer, self), f"Archives ({len(MODEL.unknown_conflicts())})")
         tabs.addTab(ScriptTab(self), f"redscript ({real_scripts})")
         rr = MODEL.rules_report
         tabs.addTab(RulesTab(organizer, self), f"Load order rules ({len(rr.violations) + len(rr.bottom_violations) + len(rr.incompatible) + len(rr.missing)})")
