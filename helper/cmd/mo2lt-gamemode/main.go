@@ -201,12 +201,6 @@ func (g *gameMode) register(pid int) error {
 	return nil
 }
 
-func (g *gameMode) unregister(pid int) {
-	if ret, err := g.callPID("UnregisterGameByPID", pid); err != nil || ret != 0 {
-		log.Printf("unregister pid %d: ret=%d err=%v", pid, ret, err)
-	}
-}
-
 // gamemodedFallback uses the gamemoded client when the session bus is not
 // reachable. Inside pressure-vessel the host binary lives under /run/host.
 func gamemodedFallback(pid int) error {
@@ -258,9 +252,8 @@ func run(tgts []string, wait, grace, poll time.Duration) int {
 			if alive(pid) {
 				anyAlive = true
 			} else {
-				if gm != nil {
-					gm.unregister(pid)
-				}
+				// No UnregisterGameByPID: gamemoded reaps dead clients itself and
+				// answers -1 for a pid that is already gone.
 				log.Printf("pid %d exited", pid)
 				delete(registered, pid)
 				lastSeen = time.Now()
